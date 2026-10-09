@@ -27,9 +27,9 @@ import { withServerExecution } from "../../lib/server-execution";
 import { managedServerCollection, serverLifecycleResources } from "./server-lifecycle.operations";
 import { serverNetworkSettings } from "./server-network-settings.operations";
 import { hostControlDisabled } from "@repo/adapters";
-import { AppError, assertSshSettings, normalizeSshTransport, safeErrorMessage } from "@repo/core";
+import { AppError, assertSshSettings, normalizeSshTransport, safeErrorMessage, type HostCapacity } from "@repo/core";
 import { invalidateOpenRestyPaths } from "../../lib/openresty-paths";
-import { invalidateHostCapacity } from "../../lib/host-capacity";
+import { getHostCapacity, invalidateHostCapacity } from "../../lib/host-capacity";
 import { sshManager, type ReachabilityDiagnosis } from "../../lib/ssh-manager";
 import { resolvesToLocalHost } from "../../lib/self-host";
 import { boxOwningOrgId } from "../../lib/box-org";
@@ -71,6 +71,23 @@ function validateConnectionOptions(settings: Parameters<typeof assertSshSettings
 }
 
 /** GET /servers - list servers in the caller's active organization. */
+/** A dead box must not stall the whole server list: the GPU annotation is the least important thing on it. */
+const CAPACITY_PROBE_TIMEOUT_MS = 4000;
+
+/**
+ * Daemon-reported capacity for one server, or `null` when it could not be read in time. Never throws:
+ * the probe is an annotation, so a failure degrades to "unknown", not to a 500. Cached 5 minutes by
+ * getHostCapacity; `localFallback: false` so an unreachable remote is never described by THIS
+ * machine's hardware (the reason `getTrustedHostCapacity` exists).
+ */
+async function probeServerCapacity(serverId: string, organizationId: string): Promise<HostCapacity | null> {
+  if (env.CLOUD_MODE) return null;
+  const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), CAPACITY_PROBE_TIMEOUT_MS));
+  const probe = getHostCapacity(serverId, organizationId, { localFallback: false }).catch(() => null);
+  const got = await Promise.race([probe, timeout]);
+  return got && got.source === "docker" ? got : null;
+}
+
 async function listServers(ctx: ExecutionContext, live = true) {
 
   // Org-scoped: only the caller's org's servers.
@@ -106,7 +123,8 @@ async function listServers(ctx: ExecutionContext, live = true) {
   );
   const local = await Promise.all(all.map(async (s, i) => {
     const cloud = s.workspaceId ? await managed.summary(await requireCloudWorkspace(ctx.organizationId, s.workspaceId), live) : null;
-    return { ...serializeServer(s, cloud)!, projectCount: cloud?.projectCount ?? projectCounts[s.id] ?? 0, hostChannel: channels[i] ?? null };
+    const capacity = s.workspaceId ? null : await probeServerCapacity(s.id, ctx.organizationId);
+    return { ...serializeServer(s, cloud, capacity)!, projectCount: cloud?.projectCount ?? projectCounts[s.id] ?? 0, hostChannel: channels[i] ?? null };
   }));
   return mergeCloudServerInventory(ctx, local);
 }
@@ -133,7 +151,7 @@ async function getServer(ctx: ExecutionContext, id: string) {
     .countActiveByServer(ctx.organizationId)
     .catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/system/server.operations"); return ({}) as Record<string, number>; });
   return {
-    ...serializeServer(server, cloud),
+    ...serializeServer(server, cloud, server.workspaceId ? null : await probeServerCapacity(server.id, ctx.organizationId)),
     projectCount: cloud?.projectCount ?? projectCounts[id] ?? 0,
     hostChannel: server.isLocal ? await localServerHostChannel(server.id).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/system/server.operations"); return null; }) : null,
   };
@@ -370,6 +388,8 @@ async function updateServer(ctx: ExecutionContext, id: string, body: UpdateServe
   if (body.sshTransport !== undefined)
     patch.sshTransport = normalizeSshTransport(body.sshTransport);
   if (body.sshArgs !== undefined) patch.sshArgs = body.sshArgs?.trim() || null;
+  // Manual GPU mark. Deliberately not a "connection" field (it is allowed on the local row too).
+  if (body.gpuOverride !== undefined) patch.gpuOverride = body.gpuOverride;
 
   if (Object.keys(patch).length === 0) {
     return failServer({ error: "No fields to update" }, 400);
