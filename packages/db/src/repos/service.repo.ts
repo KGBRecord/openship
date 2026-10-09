@@ -389,6 +389,7 @@ const COMPOSE_OWNED_ADVANCED_KEYS = [
   "networkMode",
   "pidMode",
   "entrypoint",
+  "gpus",
   "imageTemplate",
   "environmentTemplateKeys",
   "environmentOverrideKeys",
