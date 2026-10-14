@@ -1,5 +1,6 @@
 "use client";
 
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import { useEffect, useState } from "react";
 import { authClient } from "@/lib/auth-client";
 import { setActiveOrganizationId } from "@/lib/api/client";
@@ -29,12 +30,14 @@ export function CloudBillingLink({
   workspaceId,
   embedded = false,
   newServer = false,
+  purchase,
 }: {
   organizationId: string;
   tab: BillingTab;
   workspaceId?: string;
   embedded?: boolean;
   newServer?: boolean;
+  purchase?: Parameters<typeof newServerBillingHref>[1];
 }) {
   const { t } = useI18n();
   const [failed, setFailed] = useState(false);
@@ -53,15 +56,16 @@ export function CloudBillingLink({
           return;
         }
         setActiveOrganizationId(organizationId);
-        window.location.assign(newServer ? newServerBillingHref(organizationId) : scopedBillingHref(`/billing/${tab}`, { workspaceId, organizationId }));
+        window.location.assign(newServer ? newServerBillingHref(organizationId, purchase) : scopedBillingHref(`/billing/${tab}`, { workspaceId, organizationId }));
       })
-      .catch(() => {
+      .catch((diagnosticFailure) => {
+        observeCaughtError(diagnosticFailure, "dashboard/components/billing/CloudBillingLink");
         if (!disposed) setFailed(true);
       });
     return () => {
       disposed = true;
     };
-  }, [organizationId, tab, workspaceId, newServer]);
+  }, [organizationId, tab, workspaceId, newServer, purchase]);
   const content = failed ? (
     <div role="alert" className="space-y-4 rounded-2xl bg-card p-5">
       <p className="text-sm text-muted-foreground">{t.billing.creditAlert.wrongOrganization}</p>

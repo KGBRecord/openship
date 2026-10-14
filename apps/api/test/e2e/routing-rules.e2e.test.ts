@@ -393,6 +393,35 @@ http {
         });
     }
 
+    // A paths-only import must never acquire an implicit catch-all. Keep the
+    // existing complete table when a retry cannot resolve one of its targets.
+    for (const backend of ["http://127.0.0.1:9904", null]) {
+      const planned = buildDomainFanoutRegistrations({
+        routes: [{
+          hostname: "pathonly.test",
+          isCustomDomain: true,
+          locations: [
+            { pathPrefix: "/v3/", serviceId: "api" },
+            { pathPrefix: "/mcp", exact: true, serviceId: "web" },
+          ],
+        }, {
+          hostname: "exactroot.test",
+          isCustomDomain: true,
+          locations: [{ pathPrefix: "/", exact: true, serviceId: "web" }],
+        }],
+        resolveTargetUrl: (id) => id === "web" ? "http://127.0.0.1:9901" : backend,
+      });
+      for (const route of planned) {
+        expect(route.notFound).toBe(true);
+        out[route.hostname] = await renderVhost({
+          domain: route.hostname,
+          tls: false,
+          notFound: true,
+          proxyLocations: route.proxyLocations,
+        });
+      }
+    }
+
     for (const host of ["rules.test", "other-rules.test", "rate.test", "other-rate.test"]) {
       out[host] = await renderVhost({
         domain: host,
@@ -466,6 +495,22 @@ http {
   }
 
   // ── The rule this whole change exists for ────────────────────────────────────
+
+  it("preserves path-only upstreams after an incomplete retry and returns 404 elsewhere", async () => {
+    const api = await ask(port, "/v3/items?limit=2", "pathonly.test");
+    expect(api.status).toBe(200);
+    expect(api.body).toContain("BACKEND uri=/v3/items?limit=2");
+    const exact = await ask(port, "/mcp?request=1", "pathonly.test");
+    expect(exact.status).toBe(200);
+    expect(exact.body).toContain("APP uri=/mcp?request=1");
+    for (const path of ["/", "/private", "/v3-other", "/mcp/child"])
+      expect((await ask(port, path, "pathonly.test")).status, path).toBe(404);
+  });
+
+  it("keeps an exact root separate from a catch-all", async () => {
+    expect((await ask(port, "/?request=1", "exactroot.test")).status).toBe(200);
+    expect((await ask(port, "/anything", "exactroot.test")).status).toBe(404);
+  });
 
   it("carries a wildcard capture into the redirect, with the query string", async () => {
     // The bug: served from a prefix location, `$1` expanded to empty and every visitor
@@ -587,13 +632,19 @@ http {
     expect(api.headers["x-one"]).toBe("1");
     expect(api.headers["x-two"]).toBe("2");
 
-    const dash = await ask(port, "/a-b/x", "hdrs.test");
+    const dash = await ask(port, "/a-b/", "hdrs.test");
     expect(dash.headers["x-dash"]).toBe("dash");
     expect(dash.headers["x-slash"]).toBeUndefined();
 
-    const slash = await ask(port, "/a/b/x", "hdrs.test");
+    const slash = await ask(port, "/a/b/", "hdrs.test");
     expect(slash.headers["x-slash"]).toBe("slash");
     expect(slash.headers["x-dash"]).toBeUndefined();
+
+    // Literal Vercel sources match exactly, including when a query is present.
+    // Descendants require an explicit wildcard (as used by the /api rules).
+    expect((await ask(port, "/a-b/?q=1", "hdrs.test")).headers["x-dash"]).toBe("dash");
+    expect((await ask(port, "/a-b/x", "hdrs.test")).headers["x-dash"]).toBeUndefined();
+    expect((await ask(port, "/a/b/x", "hdrs.test")).headers["x-slash"]).toBeUndefined();
 
     // Global applies everywhere; path-scoped rules are absent off their path.
     for (const path of ["/", "/api/thing", "/a-b/x"]) {

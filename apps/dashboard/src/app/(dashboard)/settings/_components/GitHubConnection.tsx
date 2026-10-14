@@ -1,5 +1,6 @@
 "use client";
 
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import { Icon as UiIcon, type IconName } from "@repo/ui/icons";
 
 import { useState, useEffect, useCallback, useRef } from "react";
@@ -88,7 +89,8 @@ export function GitHubConnection() {
       setInstallUrl(res?.installUrl || null);
       setCapabilities((res?.capabilities as GitHubCapabilities | undefined) ?? null);
       setCustomSourcesConfigured(res?.customSourcesConfigured === true);
-    } catch {
+    } catch (diagnosticFailure) {
+      observeCaughtError(diagnosticFailure, "dashboard/app/(dashboard)/settings/_components/GitHubConnection");
       if (request !== statusRequest.current) return;
       setState(EMPTY_STATE);
       setAccounts([]);
@@ -105,7 +107,9 @@ export function GitHubConnection() {
     void settingsApi
       .get()
       .then((r) => setForwardGit(!!r.forwardGitToServer))
-      .catch(() => {});
+      .catch((diagnosticFailure) => {
+        observeCaughtError(diagnosticFailure, "dashboard/app/(dashboard)/settings/_components/GitHubConnection");
+      });
     return () => {
       statusRequest.current++;
     };
@@ -508,6 +512,9 @@ export function GitHubConnection() {
                 cloudConnected={cloudConnected}
                 connecting={connecting}
                 showSignIn={!ghConnected}
+                hostCliLogin={
+                  isSelfHosted && ghConnected && ghMethod === "host-cli" ? ghLogin : undefined
+                }
                 showApp={!appConnected && !customSourcesConfigured}
                 onSignIn={() => connect("cli")}
                 onConnectApp={() => connect("oauth")}
@@ -765,7 +772,9 @@ function DeviceFlowPanel(props: {
           <button
             type="button"
             onClick={() =>
-              void navigator.clipboard?.writeText(cliAction.userCode ?? "").catch(() => {})
+              void navigator.clipboard?.writeText(cliAction.userCode ?? "").catch((diagnosticFailure) => {
+                observeCaughtError(diagnosticFailure, "dashboard/app/(dashboard)/settings/_components/GitHubConnection");
+              })
             }
             title={t.settings.github.copyCode}
             className="rounded-md bg-muted px-3 py-1.5 font-mono text-base font-bold tracking-widest text-foreground hover:bg-muted/70 transition-colors"
@@ -833,6 +842,8 @@ function MethodChooser(props: {
   cloudConnected: boolean;
   connecting: boolean;
   showSignIn: boolean;
+  /** A detected host login still needs an explicit selection for repository operations. */
+  hostCliLogin?: string;
   showApp: boolean;
   primary?: boolean;
   primaryMethod?: MethodKind | null;
@@ -848,6 +859,7 @@ function MethodChooser(props: {
     cloudConnected,
     connecting,
     showSignIn,
+    hostCliLogin,
     showApp,
     primary,
     primaryMethod,
@@ -895,6 +907,17 @@ function MethodChooser(props: {
   // Every row is gated on the BACKEND's verdict. A method the resolver would
   // refuse is never rendered, so the UI cannot advertise a dead path.
   const others = [
+    ...(hostCliLogin
+      ? [
+          row(
+            "host-cli",
+            "terminal",
+            t.settings.github.ghCli.use,
+            interpolate(t.settings.github.ghCli.loggedInAs, { login: hostCliLogin }),
+            onSignIn,
+          ),
+        ]
+      : []),
     ...(showApp && can("app") && lead !== "app" ? [appRow] : []),
     ...(can("ssh-key")
       ? [

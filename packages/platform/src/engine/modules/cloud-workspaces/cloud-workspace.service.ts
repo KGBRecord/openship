@@ -1,3 +1,4 @@
+import { reportCaughtError as observeCaughtError, diagnostics as errorDiagnostics } from "@repo/core/diagnostics";
 import { createHash, randomUUID } from "node:crypto";
 import { AppError, safeErrorMessage } from "@repo/core";
 import { repos, type CloudWorkspace, type CloudWorkspaceOperation } from "@repo/db";
@@ -134,7 +135,8 @@ export async function summary(row: CloudWorkspace, live = false): Promise<CloudW
         state = cloudWorkspaceStatus(host.provider.workspace);
         resources = host.provider.allocation;
       }
-    } catch {
+    } catch (diagnosticFailure) {
+      observeCaughtError(diagnosticFailure, "platform/engine/modules/cloud-workspaces/cloud-workspace.service");
       state = "unreachable";
     }
   }
@@ -166,7 +168,7 @@ export async function summary(row: CloudWorkspace, live = false): Promise<CloudW
 export async function get(ctx: ExecutionContext, id: string) {
   if (!env.CLOUD_MODE) {
     await reconcileLinkedOperation(id).catch(error =>
-      console.warn(`[cloud-workspace] ${id}: ${safeErrorMessage(error)}`));
+      errorDiagnostics.warn("platform/engine/modules/cloud-workspaces/cloud-workspace.service", `[cloud-workspace] ${id}: ${safeErrorMessage(error)}`, error));
   }
   return summary(await requireCloudWorkspace(ctx.organizationId, id), true);
 }
@@ -176,20 +178,32 @@ export async function create(
 ) {
   if (!env.CLOUD_MODE) return createLinkedCloudServer(ctx.organizationId, input);
   requireSaas();
-  const rows = await repos.cloudWorkspace.listByOrganization(ctx.organizationId);
-  // Draft identities don't reserve machines. Bound abandoned checkout drafts.
-  if (rows.filter((row) => !row.namespace && row.planTierId === "free").length >= 10)
-    throw new AppError(
-      "Finish setup or remove an unused server before adding another",
-      409,
-      "CLOUD_WORKSPACE_DRAFT_LIMIT",
+  // A pricing handoff must recover a lost create response, including after reload.
+  // Keys resolve only within the authenticated organization; callers cannot supply IDs.
+  return createProvisionLock(`cloud:workspace:create:${ctx.organizationId}`).run(async () => {
+    const id = input.idempotencyKey ? `cws_${digest([ctx.organizationId, input.idempotencyKey])}` : undefined;
+    if (id) {
+      const existing = await repos.cloudWorkspace.findByIdInOrganization(id, ctx.organizationId);
+      if (existing?.deletionInProgress || await repos.cloudWorkspace.findWorkspaceDeletion(id, ctx.organizationId))
+        throw new AppError("This server purchase was removed. Start a new purchase from Pricing.", 409, "CLOUD_WORKSPACE_PURCHASE_REMOVED");
+      if (existing) return summary(existing);
+    }
+    const rows = await repos.cloudWorkspace.listByOrganization(ctx.organizationId);
+    // Draft identities don't reserve machines. Bound abandoned checkout drafts.
+    if (rows.filter((row) => !row.namespace && row.planTierId === "free").length >= 10)
+      throw new AppError(
+        "Finish setup or remove an unused server before adding another",
+        409,
+        "CLOUD_WORKSPACE_DRAFT_LIMIT",
+      );
+    return summary(
+      await repos.cloudWorkspace.create({
+        organizationId: ctx.organizationId,
+        name: input.name.trim(),
+        ...(id ? { id } : {}),
+      }),
     );
-  return summary(
-    await repos.cloudWorkspace.create({
-      organizationId: ctx.organizationId,
-      name: input.name.trim(),
-    }),
-  );
+  });
 }
 export async function rename(ctx: ExecutionContext, id: string, input: { name: string }) {
   if (!env.CLOUD_MODE) {
@@ -245,7 +259,7 @@ function operation(
 }
 function dispatch(id: string) {
   void trackBackgroundWork(processWorkspaceOperation(id)).catch((error) =>
-    console.warn(`[cloud-workspace] ${id}: ${safeErrorMessage(error)}`),
+    errorDiagnostics.warn("platform/engine/modules/cloud-workspaces/cloud-workspace.service", `[cloud-workspace] ${id}: ${safeErrorMessage(error)}`, error),
   );
 }
 export async function ensure(ctx: ExecutionContext, id: string) {
@@ -664,6 +678,7 @@ export async function processWorkspaceOperation(id: string): Promise<void> {
             : "Server is ready for projects.",
         );
       } catch (error) {
+        observeCaughtError(error, "platform/engine/modules/cloud-workspaces/cloud-workspace.service");
         const terminal = op.attempts >= 3 || (error instanceof AppError && error.statusCode < 500);
         op = {
           ...op,
@@ -716,14 +731,14 @@ export async function runCloudWorkspaceRecovery() {
     const { reconcileWorkspaceSubscriptionChange } = await import("../billing/billing-plan-change");
     for (const row of await repos.cloudWorkspace.listPendingSubscriptionChanges())
       await reconcileWorkspaceSubscriptionChange(row.organizationId, row.id).catch(error =>
-        console.warn(`[cloud-plan-change] ${row.id}: ${safeErrorMessage(error)}`));
+        errorDiagnostics.warn("platform/engine/modules/cloud-workspaces/cloud-workspace.service", `[cloud-plan-change] ${row.id}: ${safeErrorMessage(error)}`, error));
   }
   for (const row of await repos.cloudWorkspace.listSettledLinkedActivities()) {
     await reconcileSettledCloudActivity(row).catch(error =>
-      console.warn(`[cloud-activity] ${row.id}: ${safeErrorMessage(error)}`));
+      errorDiagnostics.warn("platform/engine/modules/cloud-workspaces/cloud-workspace.service", `[cloud-activity] ${row.id}: ${safeErrorMessage(error)}`, error));
   }
   const rows = await repos.cloudWorkspace.listPendingOperations();
   for (const row of rows) await processWorkspaceOperation(row.id).catch(error =>
-    console.warn(`[cloud-workspace] ${row.id}: ${safeErrorMessage(error)}`));
+    errorDiagnostics.warn("platform/engine/modules/cloud-workspaces/cloud-workspace.service", `[cloud-workspace] ${row.id}: ${safeErrorMessage(error)}`, error));
   return { attempted: rows.length };
 }

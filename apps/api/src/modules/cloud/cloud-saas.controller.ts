@@ -17,8 +17,9 @@
  *   POST /api/cloud/exchange-code     - exchange code for user + session (no auth)
  */
 
+import { reportCaughtError as observeCaughtError, diagnostics as errorDiagnostics } from "@repo/core/diagnostics";
 import type { Context } from "hono";
-import { AppError } from "@repo/core";
+import { AppError, validateGitHubInstallationScope } from "@repo/core";
 import { getRequestContext } from "../../lib/request-context";
 import { auth } from "@repo/platform/engine/lib/auth";
 import { issueNamespaceToken } from "@repo/platform/engine/lib/openship-cloud";
@@ -81,6 +82,9 @@ import {
 
 /** Coerce a thrown Oblien SDK error into an HTTP response shape. */
 function oblienErrorResponse(c: Context, err: unknown, fallback: string) {
+  // Application permission/validation failures retain their status and safe
+  // response through the shared handler; they are not provider server faults.
+  if (err instanceof AppError) throw err;
   const message = err instanceof Error ? err.message : fallback;
   const status =
     typeof err === "object" && err !== null && "status" in err && typeof (err as { status?: unknown }).status === "number"
@@ -94,7 +98,7 @@ function oblienErrorResponse(c: Context, err: unknown, fallback: string) {
   // is not enough for a DB error (we need the pg code + stack). 4xx are expected
   // control-flow (validation, conflicts) and stay quiet.
   if (status >= 500) {
-    console.error(`[cloud] ${fallback}:`, err);
+    errorDiagnostics.error("api/modules/cloud/cloud-saas.controller", `[cloud] ${fallback}:`, err);
   }
   c.status(status as 400 | 401 | 403 | 404 | 409 | 422 | 429 | 500);
   return c.json({ error: message, code });
@@ -128,6 +132,7 @@ export async function analyticsProxy(c: Context) {
     const result = await proxyCloudAnalytics(ctx.organizationId, { operation, domain, params });
     return c.json({ data: result });
   } catch (err) {
+    observeCaughtError(err, "api/modules/cloud/cloud-saas.controller");
     if (err instanceof CloudAnalyticsForbiddenError) {
       return c.json({ error: err.message }, 403);
     }
@@ -139,23 +144,18 @@ export async function analyticsProxy(c: Context) {
 
 export async function getToken(c: Context) {
   const ctx = getRequestContext(c);
-  const result = await issueNamespaceToken(ctx.organizationId, null);
+  const { authorizeCloudRelayWorkspace } = await import("./cloud-relay-access");
+  const workspaceId = await authorizeCloudRelayWorkspace(ctx);
+  const result = await issueNamespaceToken(ctx.organizationId, workspaceId);
+  c.header("Cache-Control", "no-store");
   return c.json({ data: result });
 }
 
 export async function preflight(c: Context) {
   const ctx = getRequestContext(c);
   const body = await c.req.json<{ slug?: string; customDomain?: string }>();
-  let workspaceId: string | null = null;
-  const serverId = c.req.query("serverId");
-  if (serverId) {
-    const { workspaceForServer } = await import("@repo/platform/engine/lib/cloud-workspace-scope");
-    const { authorization } = await import("@repo/platform/engine/lib/authorization");
-    const { workspace } = await workspaceForServer(ctx.organizationId, serverId);
-    if (!workspace) return c.json({ error: "Managed server not found" }, 404);
-    await authorization.authorize(ctx, { resourceType: "server", resourceId: serverId, action: "write" });
-    workspaceId = workspace.id;
-  }
+  const { authorizeCloudRelayWorkspace } = await import("./cloud-relay-access");
+  const workspaceId = await authorizeCloudRelayWorkspace(ctx, c.req.query("serverId"), "write");
   const result = await runCloudPreflight(ctx.organizationId, {
     slug: body.slug,
     customDomain: body.customDomain,
@@ -320,7 +320,8 @@ export async function connectAuthorize(c: Context) {
   let body: { redirect?: string; state?: string; codeChallenge?: string; mode?: string };
   try {
     body = await c.req.json<{ redirect?: string; state?: string; codeChallenge?: string; mode?: string }>();
-  } catch {
+  } catch (diagnosticFailure) {
+    observeCaughtError(diagnosticFailure, "api/modules/cloud/cloud-saas.controller");
     return c.json({ error: "Invalid JSON body", code: "INVALID_BODY" }, 400);
   }
 
@@ -398,7 +399,7 @@ export async function connectAuthorize(c: Context) {
     callbackUrl.searchParams.set("state", state);
     return c.json({ callbackUrl: callbackUrl.toString() });
   } catch (err) {
-    console.error("[connect-authorize] mint failed:", err);
+    errorDiagnostics.error("api/modules/cloud/cloud-saas.controller", "[connect-authorize] mint failed:", err);
     return c.json(
       { error: "Failed to mint handoff code", code: "MINT_FAILED" },
       500,
@@ -473,6 +474,7 @@ export async function syncEdgeProxy(c: Context) {
     if (!result.ok) return c.json({ error: result.error }, result.status);
     return c.json({ ok: true, hostname: result.hostname });
   } catch (err) {
+    observeCaughtError(err, "api/modules/cloud/cloud-saas.controller");
     return oblienErrorResponse(c, err, "Failed to sync edge proxy");
   }
 }
@@ -495,6 +497,7 @@ export async function deleteEdgeProxy(c: Context) {
     if (!result.ok) return c.json({ error: result.error }, result.status);
     return c.json({ ok: true, removed: result.removed });
   } catch (err) {
+    observeCaughtError(err, "api/modules/cloud/cloud-saas.controller");
     return oblienErrorResponse(c, err, "Failed to delete edge proxy");
   }
 }
@@ -517,6 +520,7 @@ export async function requestEdgeVerification(c: Context) {
     if (!result.ok) return c.json({ error: result.error }, result.status);
     return c.json({ ok: true, verification: result.verification });
   } catch (err) {
+    observeCaughtError(err, "api/modules/cloud/cloud-saas.controller");
     return oblienErrorResponse(c, err, "Failed to request edge target verification");
   }
 }
@@ -541,6 +545,7 @@ export async function checkEdgeVerification(c: Context) {
     if (!result.ok) return c.json({ error: result.error }, result.status);
     return c.json({ ok: true, verification: result.verification });
   } catch (err) {
+    observeCaughtError(err, "api/modules/cloud/cloud-saas.controller");
     return oblienErrorResponse(c, err, "Failed to check edge target verification");
   }
 }
@@ -580,6 +585,7 @@ export async function pagesProxy(c: Context) {
     });
     return c.json(result);
   } catch (err) {
+    observeCaughtError(err, "api/modules/cloud/cloud-saas.controller");
     return oblienErrorResponse(c, err, "Failed to create page");
   }
 }
@@ -601,6 +607,7 @@ export async function pagesDisable(c: Context) {
     if (!result.ok) return c.json({ error: result.error }, result.status);
     return c.json({ ok: true });
   } catch (err) {
+    observeCaughtError(err, "api/modules/cloud/cloud-saas.controller");
     return oblienErrorResponse(c, err, "Failed to disable page");
   }
 }
@@ -622,6 +629,7 @@ export async function pagesEnable(c: Context) {
     if (!result.ok) return c.json({ error: result.error }, result.status);
     return c.json({ ok: true });
   } catch (err) {
+    observeCaughtError(err, "api/modules/cloud/cloud-saas.controller");
     return oblienErrorResponse(c, err, "Failed to enable page");
   }
 }
@@ -643,6 +651,7 @@ export async function pagesDelete(c: Context) {
     if (!result.ok) return c.json({ error: result.error }, result.status);
     return c.json({ ok: true });
   } catch (err) {
+    observeCaughtError(err, "api/modules/cloud/cloud-saas.controller");
     return oblienErrorResponse(c, err, "Failed to delete page");
   }
 }
@@ -686,6 +695,7 @@ export async function sendInvitation(c: Context) {
     if (!result.ok) return c.json({ error: result.error }, result.status);
     return c.json({ ok: true, messageId: result.messageId });
   } catch (err) {
+    observeCaughtError(err, "api/modules/cloud/cloud-saas.controller");
     return oblienErrorResponse(c, err, "Failed to send invitation");
   }
 }
@@ -790,7 +800,7 @@ export async function teardownProjectHandler(c: Context) {
   const ctx = getRequestContext(c);
   const body = await c.req
     .json<{ projectId?: string }>()
-    .catch(() => ({} as { projectId?: string }));
+    .catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "api/modules/cloud/cloud-saas.controller"); return ({} as { projectId?: string }); });
   if (!body.projectId) {
     return c.json({ error: "projectId is required" }, 400);
   }
@@ -801,6 +811,7 @@ export async function teardownProjectHandler(c: Context) {
     });
     return c.json({ ok: true });
   } catch (err) {
+    observeCaughtError(err, "api/modules/cloud/cloud-saas.controller");
     if (err instanceof TeardownProjectNotFoundError) {
       return c.json({ error: err.message, code: err.code }, 404);
     }
@@ -818,7 +829,7 @@ export async function exportSubgraphHandler(c: Context) {
   const ctx = getRequestContext(c);
   const body = await c.req
     .json<{ scope?: SubgraphScope }>()
-    .catch(() => ({} as { scope?: SubgraphScope }));
+    .catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "api/modules/cloud/cloud-saas.controller"); return ({} as { scope?: SubgraphScope }); });
   const scope: SubgraphScope = body.scope ?? { kind: "organization", organizationId: ctx.organizationId };
 
   if (scope.kind === "instance") {
@@ -846,6 +857,7 @@ export async function exportSubgraphHandler(c: Context) {
     const dump = await exportSubgraph(scope);
     return c.json({ ok: true, dump });
   } catch (err) {
+    observeCaughtError(err, "api/modules/cloud/cloud-saas.controller");
     return oblienErrorResponse(c, err, "Subgraph export failed");
   }
 }
@@ -925,7 +937,7 @@ export async function githubOauthBridge(c: Context) {
       return response;
     }
     case "failed":
-      console.error("[github oauth-bridge] failed:", result.error);
+      errorDiagnostics.error("api/modules/cloud/cloud-saas.controller", "[github oauth-bridge] failed:", result.error);
       return c.html(
         renderCallbackHtml("OAuth start failed", result.error),
         500,
@@ -1034,7 +1046,7 @@ export async function githubInstallCallback(c: Context) {
         ),
       );
     case "failed":
-      console.error("[github install-callback] failed:", result.error);
+      errorDiagnostics.error("api/modules/cloud/cloud-saas.controller", "[github install-callback] failed:", result.error);
       return c.html(
         renderCallbackHtml(
           "Install attribution failed",
@@ -1069,7 +1081,7 @@ async function githubInstallSelection(c: Context) {
     case "forbidden":
       return c.html(renderCallbackHtml("Installation not authorized", result.message), 403);
     case "failed":
-      console.error("[github install-selection] failed:", result.error);
+      errorDiagnostics.error("api/modules/cloud/cloud-saas.controller", "[github install-selection] failed:", result.error);
       return c.html(
         renderCallbackHtml(
           "Could not load GitHub accounts",
@@ -1180,7 +1192,7 @@ export async function githubInstallations(c: Context) {
  */
 export async function githubInstallationToken(c: Context) {
   const ctx = getRequestContext(c);
-  const body = await c.req.json<{ owner?: string; repos?: string[] }>();
+  const body = await c.req.json<{ owner?: string; repos?: string[]; permissions?: Record<string, "read" | "write"> }>();
   if (!body.owner) return c.json({ error: "owner is required" }, 400);
 
   // The repo-grant gate. Without it the route's `cloud:write` tag was the only check,
@@ -1189,8 +1201,10 @@ export async function githubInstallationToken(c: Context) {
   // live GitHub App installation token, and the grant system that decides WHICH repos
   // a member may touch was never consulted. The repos-vs-no-repos distinction is the
   // security-relevant part; it lives in canMintInstallationToken.
+  const scope = body.permissions ? validateGitHubInstallationScope(body.repos, body.permissions) : null;
+  const access = scope && Object.values(scope.permissions).includes("write") ? "write" : "read";
   const requested = (body.repos ?? []).map((r) => r.trim()).filter(Boolean);
-  if (!(await canMintInstallationToken(ctx, body.owner, body.repos))) {
+  if (!(await canMintInstallationToken(ctx, body.owner, body.repos, access))) {
     return c.json(
       {
         error: requested.length
@@ -1202,11 +1216,11 @@ export async function githubInstallationToken(c: Context) {
     );
   }
 
-  const result = await mintOrgInstallationToken(ctx.organizationId, body.owner, body.repos);
+  const result = await mintOrgInstallationToken(ctx.organizationId, body.owner, body.repos, scope?.permissions);
   if (result.kind === "not-found") {
     return c.json({ error: `No GitHub App installation found for ${result.owner}` }, 404);
   }
-  return c.json({ data: { token: result.token, expiresAt: result.expiresAt } });
+  return c.json({ data: { token: result.token, expiresAt: result.expiresAt, ...(scope ? { scope } : {}) } });
 }
 
 /**

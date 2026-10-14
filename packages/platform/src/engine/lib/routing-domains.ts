@@ -1,3 +1,4 @@
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import { repos, type Domain, type Project, type Service } from "@repo/db";
 import {
   isRemoteConnectionError,
@@ -13,7 +14,7 @@ import {
   resolveServicePublicEndpoints,
   type StoredPublicEndpoint,
 } from "./public-endpoints";
-import { acmeIssueLockKey, domainDnsProvisionOptions, LOCAL_ACME_SCOPE, resolveSslPatch, sslIssueLockKey } from "./domain-ssl";
+import { acmeIssueLockKey, domainDnsProvisionOptions, LOCAL_ACME_SCOPE, persistSslResult, resolveSslPatch, sslIssueLockKey } from "./domain-ssl";
 import { resolveRouteRedirect } from "./domain-redirect";
 import { createProvisionLock } from "./provision-lock";
 import { generateToken } from "./domain-token";
@@ -169,6 +170,7 @@ export function hostTerminatesTlsLocally(
 export function resolveRouteDestination(
   input: { targetPath?: string | null; targetPort?: number | null },
   isStatic?: boolean,
+  staticContainerPort?: number,
 ): { targetPort?: number; targetPath?: string } | undefined {
   // THE DEPLOYMENT'S SHAPE DECIDES, not the stored hint.
   //
@@ -200,6 +202,21 @@ export function resolveRouteDestination(
   // this hostname is not a destination — it is stale state, and ignoring it here
   // is what lets the reconcile clear it.
   if (input.targetPort != null) return { targetPort: input.targetPort };
+  // Managed Docker serves static output through nginx, not a host file root.
+  // Only an explicitly configured root endpoint may become that container's port.
+  if (staticContainerPort !== undefined && input.targetPath) {
+    if (input.targetPath !== "/")
+      throw new Error(
+        "Container-served static sites require a root (/) endpoint; use routing rules for subpaths",
+      );
+    if (
+      !Number.isInteger(staticContainerPort) ||
+      staticContainerPort < 1 ||
+      staticContainerPort > 65535
+    )
+      throw new Error("The static container has no valid serving port");
+    return { targetPort: staticContainerPort };
+  }
   return undefined;
 }
 
@@ -229,8 +246,18 @@ export function buildProjectRouteDomains(opts: {
    * files were built and the deploy reported ready.
    */
   isStatic?: boolean;
+  /** Serving port for a static workload hosted in a container, not a file root. */
+  staticContainerPort?: number;
 }): PlannedRouteDomain[] {
-  const { projectDomains, managedSlug, publicEndpoints, runtimeName, usesManagedRouting, isStatic } = opts;
+  const {
+    projectDomains,
+    managedSlug,
+    publicEndpoints,
+    runtimeName,
+    usesManagedRouting,
+    isStatic,
+    staticContainerPort,
+  } = opts;
   const baseDomain = getRoutingBaseDomain();
   const seen = new Set<string>();
   const planned: PlannedRouteDomain[] = [];
@@ -322,6 +349,7 @@ export function buildProjectRouteDomains(opts: {
       const destination = resolveRouteDestination(
         { targetPath: endpoint.targetPath, targetPort: endpoint.port },
         isStatic,
+        staticContainerPort,
       );
 
       if (!destination) {
@@ -349,7 +377,9 @@ export function buildProjectRouteDomains(opts: {
       }
 
       const routeSlug = endpoint.domain || managedSlug;
-      if (routeSlug && usesManagedRouting) {
+      // Cloud owns the managed hostname through its provider even though it
+      // does not use the local OpenResty/managed-edge routing path.
+      if (routeSlug && (usesManagedRouting || opts.certificateManagement === "provider")) {
         add(`${routeSlug}.${baseDomain}`, {
           domainType: "free",
           destination,
@@ -384,6 +414,7 @@ export function buildProjectRouteDomains(opts: {
       destination: resolveRouteDestination(
         { targetPath: domain.targetPath, targetPort: domain.targetPort },
         isStatic,
+        staticContainerPort,
       ),
       isPrimary: domain.isPrimary,
       verified: domain.verified,
@@ -644,8 +675,7 @@ export function createTrackedSslProvider(
   const persist = async (hostname: string, result: SslResult) => {
     const domainRecord = domainByHostname.get(hostname.toLowerCase());
     if (domainRecord) {
-      const patch = resolveSslPatch(domainRecord.sslStatus, result);
-      if (patch?.sslStatus === "active") await repos.domain.updateSsl(domainRecord.id, patch);
+      await persistSslResult(domainRecord.id, domainRecord.sslStatus, result);
     }
     return result;
   };
@@ -676,7 +706,7 @@ export function createTrackedSslProvider(
       // or prevents the existing issuance/recovery path from running.
       const dnsChallenge = ssl.certificateManagement !== "provider" &&
         (host.startsWith("*.") || domainRecord?.sslChallenge === "dns-01");
-      const onDisk = log || dnsChallenge ? await ssl.verifyCert(host).catch(() => null) : null;
+      const onDisk = log || dnsChallenge ? await ssl.verifyCert(host).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/lib/routing-domains"); return null; }) : null;
       const noCertYet = onDisk?.reason === "missing";
       log?.(noCertYet
         ? `No HTTPS certificate found for ${host}; the HTTP route is configured while certificate issuance is in progress.`
@@ -700,6 +730,7 @@ export function createTrackedSslProvider(
           );
         }
       } catch (err) {
+        observeCaughtError(err, "platform/engine/lib/routing-domains");
         errorReason = safeErrorMessage(err);
         const unknown: SslResult = {
           domain: host,
@@ -713,11 +744,12 @@ export function createTrackedSslProvider(
         // itself failed, preserve the last known state until it can be checked.
         result = isRemoteConnectionError(err)
           ? unknown
-          : await ssl.verifyCert(host).catch(() => unknown);
+          : await ssl.verifyCert(host).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/lib/routing-domains"); return unknown; });
         if (result.verified && result.reason !== "not_local") {
           try {
             await ssl.activateCert?.(host);
           } catch (activationError) {
+            observeCaughtError(activationError, "platform/engine/lib/routing-domains");
             errorReason = safeErrorMessage(activationError);
             result = { ...result, verified: false, reason: "read_error" };
           }
@@ -739,10 +771,17 @@ export function createTrackedSslProvider(
         await repos.domain.recordSslFailure(
           domainRecord.id,
           errorReason ?? "The HTTPS certificate could not be checked on the deployment server.",
+          "unknown",
         );
         log?.(
           `Could not confirm SSL for ${host}; keeping its recorded certificate state.${errorReason ? ` ${errorReason}` : ""}`,
         );
+        return result;
+      }
+
+      if (result.reason === "pending") {
+        await persist(host, result);
+        log?.(`Certificate issuance for ${host} is still in progress.`);
         return result;
       }
 
@@ -767,8 +806,8 @@ export function createTrackedSslProvider(
         return result;
       }
 
-      const reason = errorReason ?? "No usable HTTPS certificate was found on the server.";
-      await repos.domain.recordSslFailure(domainRecord.id, reason, true);
+      const reason = errorReason ?? result.detail ?? "No usable HTTPS certificate was found on the server.";
+      await repos.domain.recordSslFailure(domainRecord.id, reason, "invalid");
       log?.(
         `SSL check failed for ${host}: ${reason}. Retry from the domain details after correcting the cause.`,
       );
@@ -785,6 +824,12 @@ export function createTrackedSslProvider(
     verifyCert: async (hostname: string) => persist(hostname, await ssl.verifyCert(hostname)),
     installCert: async (hostname, cert) => persist(hostname, await ssl.installCert(hostname, cert)),
   };
+}
+
+function hostnameOwnershipConflict(hostname: string, owner: Domain): ConflictError {
+  return new ConflictError(owner.ownerType === "mail" && owner.projectId === null
+    ? `Hostname ${hostname} is reserved for the mail service. Open the mail server's Deploy webmail screen to reconnect its webmail app, or choose another hostname.`
+    : `Hostname ${hostname} is routed by another project and cannot be claimed here.`);
 }
 
 export async function ensureRouteDomainRecord(opts: {
@@ -819,9 +864,7 @@ export async function ensureRouteDomainRecord(opts: {
   }
 
   if (owner && owner.projectId !== projectId) {
-    throw new ConflictError(
-      `Hostname ${route.hostname} is routed by another project and cannot be claimed here.`,
-    );
+    throw hostnameOwnershipConflict(route.hostname, owner);
   }
 
   const existing = domainByHostname.get(key);
@@ -891,9 +934,7 @@ export async function ensureRouteDomainRecord(opts: {
   // foreign project won that race, findOrCreateWithStatus returns its row; it
   // must not be installed in this project's route map or edge configuration.
   if (result.domain.projectId !== projectId) {
-    throw new ConflictError(
-      `Hostname ${route.hostname} is routed by another project and cannot be claimed here.`,
-    );
+    throw hostnameOwnershipConflict(route.hostname, result.domain);
   }
   domainByHostname.set(key, result.domain);
   return result;
@@ -952,27 +993,29 @@ export function withEnsuredDomainRecord(
 }
 
 /**
- * Routes that need a certificate check: TLS terminates on this server and the
- * stored record doesn't confirm an active certificate. Registration can succeed
- * with only the edge's bootstrap certificate, so routing success isn't enough.
- * Managed/external TLS, active certificates, and unrecorded domains are excluded.
+ * Routes whose TLS needs confirmation. Local TLS checks revisit non-active
+ * records; Cloud audits also inspect active custom hosts because provider
+ * metadata cannot prove the edge's SNI binding. External TLS is excluded.
  */
 function uncertifiedRouteDomains(
   routes: PlannedRouteDomain[],
   domainByHostname: Map<string, Domain>,
   /** Hosts with a routing error already reported by this deploy. */
   skipHostnames?: ReadonlySet<string>,
+  includeCloudActive = false,
 ): Domain[] {
   const domains: Domain[] = [];
   const seen = new Set<string>();
   for (const route of routes) {
-    if (!route.terminatesTlsLocally) continue;
+    const cloud = route.isCloud && route.domainType === "custom";
+    if (!route.terminatesTlsLocally && !cloud) continue;
     const key = route.hostname.toLowerCase();
     if (seen.has(key) || skipHostnames?.has(key)) continue;
     const record = domainByHostname.get(key);
     // "active" covers a certbot cert AND an operator's uploaded one; "external"
     // means TLS is terminated upstream and recorded as such. Neither is pending.
-    if (!record || record.sslStatus === "active" || record.sslStatus === "external") continue;
+    if (!record || record.sslStatus === "external" || record.externalIngress ||
+      (record.sslStatus === "active" && !(cloud && includeCloudActive))) continue;
     seen.add(key);
     domains.push(record);
   }
@@ -1037,12 +1080,12 @@ export async function auditRoutedDomainTls(opts: {
 }): Promise<string[]> {
   const { projectId, routes, routeWarnings, log } = opts;
   if (routes.length === 0) return [];
-  const rows = await repos.domain.listByProject(projectId).catch(() => null);
+  const rows = await repos.domain.listByProject(projectId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/lib/routing-domains"); return null; });
   if (!rows) return [];
   const domainByHostname = new Map(rows.map((row) => [row.hostname.toLowerCase(), row]));
   const skipped = routeWarningHostnames(routeWarnings);
   const unconfirmed: string[] = [];
-  for (const record of uncertifiedRouteDomains(routes, domainByHostname, skipped)) {
+  for (const record of uncertifiedRouteDomains(routes, domainByHostname, skipped, true)) {
     const host = record.hostname.toLowerCase();
     try {
       const result = await opts.ssl?.verifyCert(host);
@@ -1054,18 +1097,26 @@ export async function auditRoutedDomainTls(opts: {
         const patch = resolveSslPatch(record.sslStatus, result);
         if (patch) await repos.domain.updateSsl(record.id, patch);
         domainByHostname.delete(host);
-      } else if (result?.reason === "invalid") {
-        domainByHostname.set(host, {
-          ...record,
-          lastVerifyError: "the server's existing certificate is invalid or expired",
-        });
-      } else if (result?.reason !== "missing") {
+      } else if (result?.reason === "edge_invalid" || result?.reason === "invalid" || result?.reason === "missing") {
+        const detail = result.detail ?? (result.reason === "edge_invalid"
+          ? "the edge is serving an invalid certificate for this hostname"
+          : result.reason === "invalid" ? "the server's existing certificate is invalid or expired"
+            : record.lastVerifyError ?? "no usable HTTPS certificate was found on this server");
+        // An issuance failure is already recorded. Avoid counting the same
+        // deployment failure twice while still invalidating active/pending TLS.
+        if (record.sslStatus !== "error") await repos.domain.recordSslFailure(record.id, detail, "invalid");
+        domainByHostname.set(host, { ...record, sslStatus: "error", lastVerifyError: detail });
+      } else if (result?.reason === "pending") {
+        domainByHostname.delete(host);
+        unconfirmed.push(`${host}: certificate issuance is still in progress`);
+      } else {
         domainByHostname.delete(host);
         unconfirmed.push(
           `${host}: the HTTPS certificate could not be checked on the deployment target`,
         );
       }
     } catch (error) {
+      observeCaughtError(error, "platform/engine/lib/routing-domains");
       domainByHostname.delete(host);
       unconfirmed.push(`${host}: HTTPS status could not be confirmed: ${safeErrorMessage(error)}`);
     }

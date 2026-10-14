@@ -12,6 +12,7 @@
  * already exposes through HostConfig).
  */
 
+import { reportCaughtError as observeCaughtError, diagnostics as errorDiagnostics } from "@repo/core/diagnostics";
 import type Dockerode from "dockerode";
 import { PassThrough, Readable } from "node:stream";
 import { posix } from "node:path";
@@ -24,6 +25,7 @@ import {
   startExecStream,
 } from "../../runtime/docker-exec-stream";
 import { ensureScopedVolumeName, isHostPathSource } from "../../runtime/volume-namespace";
+import { resolveCloudProjectVolumeName } from "../../runtime/cloud/docker-volume";
 import { safeDumpCommand, safeRestoreCommand, type DumpCodec } from "../common/dump-pipeline";
 import { matchBackupSource } from "../common/source-match";
 import { registerExecutor } from "../registry";
@@ -154,7 +156,8 @@ function createAbortWatch(
 function destroyQuietly(stream: { destroy?: (err?: Error) => void } | undefined): void {
   try {
     stream?.destroy?.();
-  } catch {
+  } catch (diagnosticFailure) {
+    observeCaughtError(diagnosticFailure, "adapters/backup/executors/docker");
     // best-effort teardown
   }
 }
@@ -206,6 +209,7 @@ function archivePathIsDirectory(response: ArchiveInfoResponse, path: string): bo
   try {
     stat = JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
   } catch (err) {
+    observeCaughtError(err, "adapters/backup/executors/docker");
     throw new Error(`Docker returned an invalid path-stat header while inspecting ${path}`, {
       cause: err,
     });
@@ -251,10 +255,10 @@ export class DockerBackupExecutor implements BackupExecutor {
     } catch (err) {
       // Loud, because a container left frozen is an outage. Not fatal, because the
       // artifact is already whole and failing the run would not thaw anything.
-      console.error(
+      errorDiagnostics.error("adapters/backup/executors/docker",
         `[backup] ${label}: could not unpause container ${containerId.slice(0, 12)} after the ` +
           `copy — the service may still be FROZEN and needs \`docker unpause\`: ` +
-          `${(err as { message?: string })?.message ?? String(err)}`,
+          `${(err as { message?: string })?.message ?? String(err)}`, err,
       );
     }
   }
@@ -307,6 +311,7 @@ export class DockerBackupExecutor implements BackupExecutor {
         (helper) => this.containerPathIsDirectory(helper, BIND_PROBE_TARGET),
       );
     } catch (err) {
+      observeCaughtError(err, "adapters/backup/executors/docker");
       // Preserve the existing restore behavior for a declared directory that does
       // not exist yet: streamPath/receiveStream may create and populate it later.
       if (isMissingBindSourceError(err)) return true;
@@ -331,7 +336,8 @@ export class DockerBackupExecutor implements BackupExecutor {
       let data: Awaited<ReturnType<typeof container.inspect>> | null = null;
       try {
         data = await container.inspect();
-      } catch {
+      } catch (diagnosticFailure) {
+        observeCaughtError(diagnosticFailure, "adapters/backup/executors/docker");
         // Container gone — fall through to the DB-declared volumes.
       }
       if (data) {
@@ -362,33 +368,42 @@ export class DockerBackupExecutor implements BackupExecutor {
       }
     }
 
-    const sources = service.volumes
-      .map((spec, i): BackupSource | null => {
-        const parsed = parseVolumeSpec(spec);
-        if (!parsed || !parsed.source) return null;
-        // Named volumes are project-scoped at deploy time; resolve the SAME
-        // name here so the fallback mounts the real volume (not an empty one
-        // docker would auto-create). Bind mounts and grandfathered services
-        // (namespaceVolumes=false) keep the raw source.
-        //
-        // Idempotent on purpose: the column stores whatever was written at deploy
-        // time, and for services deployed from an already-scoped spec that is the
-        // SCOPED name. Prefixing twice named a volume that never existed, which docker
-        // creates empty on mount — a capture that archives nothing (now a failure
-        // rather than a green run, via the empty-source gate) and a restore into a
-        // volume nothing reads.
-        const source =
-          parsed.type === "volume" && service.namespaceVolumes
-            ? ensureScopedVolumeName(service.projectSlug, parsed.source)
-            : parsed.source;
-        return {
-          id: `${source}-${i}`,
-          source,
-          target: parsed.target,
-          type: parsed.type,
-        };
-      })
-      .filter((x): x is BackupSource => x !== null);
+    const sources = (
+      await Promise.all(
+        service.volumes.map(async (spec, i): Promise<BackupSource | null> => {
+          const parsed = parseVolumeSpec(spec);
+          if (!parsed || !parsed.source) return null;
+          // Named volumes are project-scoped at deploy time; resolve the SAME
+          // name here so the fallback mounts the real volume (not an empty one
+          // docker would auto-create). Bind mounts and grandfathered services
+          // (namespaceVolumes=false) keep the raw source.
+          //
+          // Idempotent on purpose: the column stores whatever was written at deploy
+          // time, and for services deployed from an already-scoped spec that is the
+          // SCOPED name. Prefixing twice named a volume that never existed, which docker
+          // creates empty on mount — a capture that archives nothing (now a failure
+          // rather than a green run, via the empty-source gate) and a restore into a
+          // volume nothing reads.
+          const source =
+            parsed.type !== "volume" || !service.namespaceVolumes
+              ? parsed.source
+              : this.runtime.transport?.kind === "cloud"
+                ? await resolveCloudProjectVolumeName(
+                    this.dockerode,
+                    service.projectId,
+                    service.projectSlug,
+                    parsed.source,
+                  )
+                : ensureScopedVolumeName(service.projectSlug, parsed.source);
+          return {
+            id: `${source}-${i}`,
+            source,
+            target: parsed.target,
+            type: parsed.type,
+          };
+        }),
+      )
+    ).filter((x): x is BackupSource => x !== null);
 
     await this.runtime.assertBackupAccess(service.projectId, { sources: sources.map(source => source.source) });
     if (!sources.some((source) => source.type === "bind")) return sources;
@@ -429,7 +444,8 @@ export class DockerBackupExecutor implements BackupExecutor {
         env[pair.slice(0, eq)] = pair.slice(eq + 1);
       }
       return env;
-    } catch {
+    } catch (diagnosticFailure) {
+      observeCaughtError(diagnosticFailure, "adapters/backup/executors/docker");
       return {};
     }
   }
@@ -633,7 +649,9 @@ export class DockerBackupExecutor implements BackupExecutor {
     const awaitExit = handed.awaitExit.finally(() =>
       this.thaw(quiesceId, `backup of "${sourceId}"`),
     );
-    void awaitExit.catch(() => {});
+    void awaitExit.catch((diagnosticFailure) => {
+      observeCaughtError(diagnosticFailure, "adapters/backup/executors/docker");
+    });
     return {
       stdout: handed.stdout,
       // Thaw when the copy is DONE, however it ends. `awaitExit` settles once the helper
@@ -850,7 +868,9 @@ export class DockerBackupExecutor implements BackupExecutor {
     try {
       return await fn(helper);
     } finally {
-      await helper.remove({ force: true }).catch(() => {});
+      await helper.remove({ force: true }).catch((diagnosticFailure) => {
+        observeCaughtError(diagnosticFailure, "adapters/backup/executors/docker");
+      });
     }
   }
 
@@ -868,7 +888,9 @@ export class DockerBackupExecutor implements BackupExecutor {
     try {
       return await setup(helper);
     } catch (err) {
-      await helper.remove({ force: true }).catch(() => {});
+      await helper.remove({ force: true }).catch((diagnosticFailure) => {
+        observeCaughtError(diagnosticFailure, "adapters/backup/executors/docker");
+      });
       throw err;
     }
   }
@@ -913,6 +935,7 @@ export class DockerBackupExecutor implements BackupExecutor {
         try {
           state = (await helper.inspect()).State ?? {};
         } catch (err) {
+          observeCaughtError(err, "adapters/backup/executors/docker");
           // With AutoRemove off, a vanished helper means something outside this
           // call removed it — we can never learn its exit code, so say that
           // rather than reporting a success we didn't observe.
@@ -1009,7 +1032,7 @@ export class DockerBackupExecutor implements BackupExecutor {
         const out = await helper
           .logs({ follow: false, stdout: true, stderr: true })
           .then((b) => b.toString().trim())
-          .catch(() => "");
+          .catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "adapters/backup/executors/docker"); return ""; });
         if (res.StatusCode !== 0) {
           throw new Error(
             `Local volume copy failed (${srcSourceId}→${dstSourceId}): ${out.slice(0, 500) || `exit ${res.StatusCode}`}`,
@@ -1061,7 +1084,7 @@ export class DockerBackupExecutor implements BackupExecutor {
         const out = await helper
           .logs({ follow: false, stdout: true, stderr: true })
           .then((b) => b.toString())
-          .catch(() => "");
+          .catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "adapters/backup/executors/docker"); return ""; });
         return { exists: true, empty: status.StatusCode === 0 && out.includes("VOLEMPTY") };
       },
     ); } catch (error) {
@@ -1127,7 +1150,7 @@ export class DockerBackupExecutor implements BackupExecutor {
     // through stdin — so a demux failure on the output side cannot corrupt what is
     // being restored, and the real failure already reaches the caller through the
     // `stream.on("error")` → reject below.
-    stdoutSink.on("error", () => {});
+    stdoutSink.on("error", (eventDiagnosticError) => { observeCaughtError(eventDiagnosticError, "adapters/backup/executors/docker"); });
     const stderrSink = new PassThrough();
     stderrSink.on("data", (chunk: Buffer) => {
       if (stderrChunks.length < 16) stderrChunks.push(chunk);
@@ -1161,7 +1184,8 @@ export class DockerBackupExecutor implements BackupExecutor {
       body.on("error", (err) => {
         try {
           (stream as unknown as { end?: () => void }).end?.();
-        } catch {
+        } catch (diagnosticFailure) {
+          observeCaughtError(diagnosticFailure, "adapters/backup/executors/docker");
           // best-effort
         }
         reject(err);
@@ -1173,10 +1197,11 @@ export class DockerBackupExecutor implements BackupExecutor {
         try {
           resolve({ code: await resolveExecExitCode(exec, exec.id), stderr: stderrTail() });
         } catch (err) {
+          observeCaughtError(err, "adapters/backup/executors/docker");
           reject(err);
         }
       });
-      stream.on("error", (err) => reject(err));
+      stream.on("error", (err) => { observeCaughtError(err, "adapters/backup/executors/docker"); return reject(err); });
       // Pipe body → stdin. ssh2/dockerode hijack streams are
       // bidirectional; writing to it = stdin, reading = stdout/stderr
       // (demuxed above).
@@ -1197,7 +1222,8 @@ export class DockerBackupExecutor implements BackupExecutor {
         let info: { Running?: boolean; ExitCode?: number | null };
         try {
           info = await exec.inspect();
-        } catch {
+        } catch (diagnosticFailure) {
+          observeCaughtError(diagnosticFailure, "adapters/backup/executors/docker");
           continue; // transient daemon hiccup — the ceiling still covers us
         }
         if (info.Running === false && typeof info.ExitCode === "number") {
@@ -1366,10 +1392,11 @@ export class DockerBackupExecutor implements BackupExecutor {
                 .slice(0, 16 * 1024),
             });
           } catch (err) {
+            observeCaughtError(err, "adapters/backup/executors/docker");
             reject(err);
           }
         });
-        stream.on("error", (err) => reject(err));
+        stream.on("error", (err) => { observeCaughtError(err, "adapters/backup/executors/docker"); return reject(err); });
       });
 
       try {
@@ -1403,7 +1430,9 @@ export class DockerBackupExecutor implements BackupExecutor {
     // which is fatal on the Node-hosted desktop API. Attaching a no-op handler makes
     // the rejection observed; every real awaiter still sees it, because this is the
     // same promise object they hold.
-    void awaitExit.catch(() => {});
+    void awaitExit.catch((diagnosticFailure) => {
+      observeCaughtError(diagnosticFailure, "adapters/backup/executors/docker");
+    });
 
     return { stdout, awaitExit };
   }
@@ -1454,7 +1483,9 @@ export class DockerBackupExecutor implements BackupExecutor {
     let finishSinks!: () => void;
     const sinksDone = new Promise<void>(resolve => { finishSinks = resolve; });
     let removal: Promise<unknown> | undefined;
-    const reap = () => removal ??= container.remove({ force: true }).catch(() => {});
+    const reap = () => removal ??= container.remove({ force: true }).catch((diagnosticFailure) => {
+      observeCaughtError(diagnosticFailure, "adapters/backup/executors/docker");
+    });
     const reapIfDone = () => {
       if (!sinksEnded || !exited) return;
       void reap();
@@ -1580,7 +1611,9 @@ export class DockerBackupExecutor implements BackupExecutor {
       }
     })();
 
-    void awaitExit.catch(() => {});
+    void awaitExit.catch((diagnosticFailure) => {
+      observeCaughtError(diagnosticFailure, "adapters/backup/executors/docker");
+    });
     return { stdout, awaitExit };
   }
 }

@@ -1,3 +1,4 @@
+import { diagnostics as errorDiagnostics } from "@repo/core/diagnostics";
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { OblienBillingApi, oblienOfferSchema, assertOblienEntitlementMatchesSubscription } from "@repo/platform/engine/lib/oblien-billing-api";
 import { BillingOperationSchemas } from "@repo/contracts";
@@ -5,7 +6,7 @@ import { Value } from "@sinclair/typebox/value";
 import capacityCatalog from "../../../test/fixtures/oblien-capacity-catalog.json";
 import { monthlyCloudBilling } from "../../../test/helpers/monthly-cloud-offer";
 
-beforeEach(() => vi.spyOn(console, "warn").mockImplementation(() => {}));
+beforeEach(() => vi.spyOn(errorDiagnostics, "warn").mockImplementation(() => {}));
 afterEach(() => vi.restoreAllMocks());
 
 const offer = { name: "Example SaaS", unitAmount: 1000, credits: 100, currency: "usd" as const };
@@ -29,6 +30,19 @@ function setup(body: unknown, status = 200) {
   return { api, fetcher };
 }
 describe("Oblien billing SDK and transport contract", () => {
+  it("quotes the live VM credit meter and ignores preview rate cards without sending credentials", async () => {
+    const live = { success: true, credits_per_dollar: 100, rate_card_id: "live", rates: { cpu_per_min: 1.5, memory_per_gb_min: 0.2, disk_per_gb: 0, network_per_gb: 0.15 } };
+    const { api, fetcher } = setup({ ...live, compute_rate_cards: [{ chargeEnabled: false, cpu_per_min: 0.001 }] });
+    expect(await api.getMeteredPricing()).toEqual(live);
+    expect(fetcher).toHaveBeenCalledWith("https://api.oblien.com/pricing/calculator", expect.objectContaining({ method: "GET", redirect: "error", headers: { Accept: "application/json" } }));
+  });
+  it.each([
+    { credits_per_dollar: 50, rate_card_id: "new", rates: { cpu_per_min: 1, memory_per_gb_min: 1, disk_per_gb: 0, network_per_gb: 0 } },
+    { credits_per_dollar: 100, rate_card_id: "new", rates: { cpu_per_min: -1, memory_per_gb_min: 1, disk_per_gb: 0, network_per_gb: 0 } },
+    { credits_per_dollar: 100, rate_card_id: "new", compute_rate_cards: [] },
+  ])("refuses malformed meter prices or a changed credit conversion", async body => {
+    await expect(setup({ success: true, ...body }).api.getMeteredPricing()).rejects.toMatchObject({ code: "OBLIEN_BILLING_INVALID_RESPONSE" });
+  });
   it("reads a pending capacity checkout without exposing the reseller wallet or prices", async () => {
     const pendingCheckout = { quote: { id: "quote_pending", namespace: "os-one", paymentSource: "stripe", wholesaleAmount: 940 },
       checkoutId: "cs_requested", url: "https://checkout.stripe.com/c/pay/test" };
@@ -46,6 +60,40 @@ describe("Oblien billing SDK and transport contract", () => {
       method: "POST",
     }));
     expect(JSON.parse(fetcher.mock.calls[0]![1]!.body as string)).toEqual({ namespace: "os-one", ...input });
+  });
+  it("cancels the original checkout with bounded authenticated transport and validates scope and identity", async () => {
+    const checkout = {
+      id: "bco_original",
+      kind: "subscription",
+      status: "expired",
+      paymentStatus: "unpaid",
+      fulfilled: false,
+      fulfillmentStatus: "expired",
+      namespaceCreditsGranted: 0,
+    };
+    const { api, fetcher } = setup({ success: true, namespace: "os-one", checkout });
+    expect(
+      (await api.cancelCheckout("os-one", checkout.id, { idempotencyKey: "cancel-once" })).checkout,
+    ).toEqual(checkout);
+    expect(fetcher).toHaveBeenCalledWith(
+      "https://api.oblien.com/billing/checkout/bco_original/cancel",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ namespace: "os-one", idempotencyKey: "cancel-once" }),
+        redirect: "error",
+        signal: expect.any(AbortSignal),
+        headers: expect.objectContaining({
+          "X-Client-ID": "test-id",
+          "X-Client-Secret": "test-secret",
+        }),
+      }),
+    );
+    await expect(
+      api.cancelCheckout("os-other", checkout.id, { idempotencyKey: "same" }),
+    ).rejects.toMatchObject({ code: "OBLIEN_BILLING_NAMESPACE_MISMATCH" });
+    await expect(
+      api.cancelCheckout("os-one", "cs_other", { idempotencyKey: "same" }),
+    ).rejects.toMatchObject({ code: "OBLIEN_BILLING_INVALID_RESPONSE" });
   });
   it.each([
     { quote: { id: "quote_pending", namespace: "os-other", paymentSource: "stripe" }, checkoutId: "cs_requested", url: null },
@@ -156,11 +204,12 @@ describe("Oblien billing SDK and transport contract", () => {
     await expect(api.getCheckout("os-one", "cs_private_payment_session")).rejects.toThrow(
       "No checkout was found for this organization",
     );
-    expect(console.warn).toHaveBeenCalledWith(
+    expect(errorDiagnostics.warn).toHaveBeenCalledWith(
+      expect.any(String),
       "[oblien:billing] Provider request failed",
       expect.objectContaining({ operation: "/billing/checkout/:checkoutId" }),
     );
-    expect(JSON.stringify(vi.mocked(console.warn).mock.calls)).not.toContain(
+    expect(JSON.stringify(vi.mocked(errorDiagnostics.warn).mock.calls)).not.toContain(
       "cs_private_payment_session",
     );
   });
@@ -292,10 +341,10 @@ describe("Oblien billing SDK and transport contract", () => {
       })
       .catch((error) => error);
     expect(error).toMatchObject({ statusCode: 503, code: "OBLIEN_CHECKOUT_UNAVAILABLE", message: "Cloud checkout is temporarily unavailable. Please try again later." });
-    expect(console.warn).toHaveBeenCalledExactlyOnceWith("[oblien:billing] Provider request failed", {
+    expect(errorDiagnostics.warn).toHaveBeenCalledExactlyOnceWith(expect.any(String), "[oblien:billing] Provider request failed", {
       method: "POST", operation: "/billing/checkout", providerStatus: 400, providerCode: "ER_CANT_AGGREGATE_NCOLLATIONS",
     });
-    expect(JSON.stringify(vi.mocked(console.warn).mock.calls)).not.toMatch(/private|test-secret/);
+    expect(JSON.stringify(vi.mocked(errorDiagnostics.warn).mock.calls)).not.toMatch(/private|test-secret/);
     expect(JSON.stringify(error)).not.toContain("ER_CANT_AGGREGATE_NCOLLATIONS");
     expect(fetcher).toHaveBeenCalledOnce();
   });
@@ -337,11 +386,11 @@ describe("Oblien billing SDK and transport contract", () => {
       message: "Cloud billing is unavailable. Contact Openship support. Reference: billing-support-123.",
       details: { providerCode: "billing_database_collation_error", details: { reference: "billing-support-123", retryable: false } },
     });
-    expect(console.warn).toHaveBeenCalledExactlyOnceWith("[oblien:billing] Provider request failed", {
+    expect(errorDiagnostics.warn).toHaveBeenCalledExactlyOnceWith(expect.any(String), "[oblien:billing] Provider request failed", {
       method: "POST", operation: "/billing/checkout", providerStatus: status, providerCode: "billing_database_collation_error",
       reference: "billing-support-123", retryable: false,
     });
-    expect(JSON.stringify([error, vi.mocked(console.warn).mock.calls])).not.toMatch(/private|test-secret|ER_CANT/);
+    expect(JSON.stringify([error, vi.mocked(errorDiagnostics.warn).mock.calls])).not.toMatch(/private|test-secret|ER_CANT/);
     expect(fetcher).toHaveBeenCalledOnce();
   });
   it.each([
@@ -403,25 +452,25 @@ describe("Oblien billing SDK and transport contract", () => {
       details: { providerCode: "insufficient_redeemable_balance" },
     });
     expect(error.details.checkoutRejected).toBe(status === 402 ? true : undefined);
-    expect(JSON.stringify([error, vi.mocked(console.warn).mock.calls])).not.toMatch(/Private|625|11780|walletCredits|eligibleCredits/);
+    expect(JSON.stringify([error, vi.mocked(errorDiagnostics.warn).mock.calls])).not.toMatch(/Private|625|11780|walletCredits|eligibleCredits/);
   });
   it.each(["sk_private", "test-secret", "user@private.test", "bad\nreference", "x".repeat(129)])("does not expose unsafe diagnostic reference %s", async reference => {
     const error = await setup({ success: false, code: "billing_storage_unavailable", details: { reference } }, 503)
       .api.getPolicy("private-customer").catch(error => error);
     expect(error.message).not.toContain(reference);
     expect(error.details).not.toHaveProperty("details.reference");
-    expect(JSON.stringify(vi.mocked(console.warn).mock.calls)).not.toContain(reference);
+    expect(JSON.stringify(vi.mocked(errorDiagnostics.warn).mock.calls)).not.toContain(reference);
   });
   it.each(["private account detail\nsecret", "cus_private", "sk_private", "x".repeat(81)])("does not log arbitrary provider error code %s", async code => {
     await setup({ success: false, code, message: "private account detail" }, 500).api.getPolicy("private-customer").catch(() => {});
-    expect(console.warn).toHaveBeenCalledExactlyOnceWith("[oblien:billing] Provider request failed", {
+    expect(errorDiagnostics.warn).toHaveBeenCalledExactlyOnceWith(expect.any(String), "[oblien:billing] Provider request failed", {
       method: "GET", operation: "/billing/policy/:namespace", providerStatus: 500, providerCode: "unknown",
     });
   });
   it("retains upstream authentication status in diagnostics without a namespace or credential", async () => {
     await expect(setup({ success: false, code: "unauthorized" }, 401).api.getSubscription("private-customer"))
       .rejects.toMatchObject({ statusCode: 503 });
-    expect(console.warn).toHaveBeenCalledExactlyOnceWith("[oblien:billing] Provider request failed", {
+    expect(errorDiagnostics.warn).toHaveBeenCalledExactlyOnceWith(expect.any(String), "[oblien:billing] Provider request failed", {
       method: "GET", operation: "/billing/subscription", providerStatus: 401, providerCode: "unauthorized",
     });
   });
@@ -637,6 +686,6 @@ describe("Oblien subscription changes", () => {
     const failure = await api.getPlanChange("os-one", "private_change").catch(error => error);
     expect(failure).toMatchObject({ statusCode: 409, details: { providerCode: code } });
     expect(JSON.stringify(failure)).not.toContain("secret");
-    expect(JSON.stringify(vi.mocked(console.warn).mock.calls)).not.toContain("private_change");
+    expect(JSON.stringify(vi.mocked(errorDiagnostics.warn).mock.calls)).not.toContain("private_change");
   });
 });

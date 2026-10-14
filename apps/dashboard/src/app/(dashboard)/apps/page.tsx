@@ -1,5 +1,6 @@
 "use client";
 
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import { Fragment, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { Icon } from "@repo/ui/icons";
@@ -21,6 +22,8 @@ const FEATURED_APP_IDS = [
   "ghost", "uptime-kuma", "vaultwarden", "metabase",
 ];
 function CatalogShortcut({ app }: { app: AppCatalogEntry }) {
+  const { t } = useI18n();
+  const localizedDesc = (t.library as any)?.catalog?.apps?.[app.id] || app.description;
   return (
     <Link
       href={`/apps/new?app=${encodeURIComponent(app.id)}`}
@@ -31,7 +34,7 @@ function CatalogShortcut({ app }: { app: AppCatalogEntry }) {
       </div>
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm font-medium text-foreground">{app.name}</p>
-        <p className="mt-0.5 line-clamp-2 text-xs leading-relaxed text-muted-foreground">{app.description}</p>
+        <p className="mt-0.5 line-clamp-2 text-xs leading-relaxed text-muted-foreground">{localizedDesc}</p>
       </div>
       <Icon name="arrow-right" className="size-4 shrink-0 text-muted-foreground transition-colors group-hover:text-foreground rtl:rotate-180" />
     </Link>
@@ -68,13 +71,17 @@ export default function AppsPage() {
     let cancelled = false;
     appsApi.catalog()
       .then(response => { if (!cancelled) setCatalog(response.data ?? []); })
-      .catch(() => {})
+      .catch((diagnosticFailure) => {
+        observeCaughtError(diagnosticFailure, "dashboard/app/(dashboard)/apps/page");
+      })
       .finally(() => { if (!cancelled) setCatalogLoading(false); });
     updatesApi.list(true)
       .then(response => {
         if (!cancelled) setUpdatesBehind(new Set(response.data.map(update => update.projectId)));
       })
-      .catch(() => {});
+      .catch((diagnosticFailure) => {
+        observeCaughtError(diagnosticFailure, "dashboard/app/(dashboard)/apps/page");
+      });
     return () => { cancelled = true; };
   }, []);
 

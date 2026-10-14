@@ -1,3 +1,4 @@
+import { errorReporter, type ErrorEvent } from "@repo/core/diagnostics";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Children, isValidElement, type ReactElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -57,15 +58,25 @@ function findElement<P>(node: ReactNode, type: unknown): ReactElement<P> | undef
   }
 }
 
+const diagnostics: ErrorEvent[] = [];
+
 describe("billing page failure recovery", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    await errorReporter.flush();
+    diagnostics.length = 0;
+    errorReporter.setEnabled(true);
+    errorReporter.setSink(events => { diagnostics.push(...events); });
     vi.clearAllMocks();
     mocks.getDeploymentInfo.mockResolvedValue({ selfHosted: false });
     mocks.getSession.mockResolvedValue({ user: { id: "user-a" }, session: { activeOrganizationId: "org-a" } });
     vi.spyOn(console, "warn").mockImplementation(() => {});
   });
 
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(async () => {
+    await errorReporter.flush();
+    errorReporter.setEnabled(false);
+    vi.restoreAllMocks();
+  });
 
   it.each([
     [500, undefined, "billing-unreachable"],
@@ -108,7 +119,8 @@ describe("billing page failure recovery", () => {
     const overview = findElement<{ state: unknown }>(page, BillingOverview)!;
 
     expect(overview.props.state).toBe(state);
-    expect(console.warn).not.toHaveBeenCalled();
+    await errorReporter.flush();
+    expect(diagnostics).toHaveLength(0);
   });
 
   it("passes the complimentary entitlement through to the plan comparison", async () => {
@@ -147,9 +159,10 @@ describe("billing page failure recovery", () => {
 
     await loadPage();
 
-    expect(console.warn).toHaveBeenCalledExactlyOnceWith("[billing] GET /billing/state failed", {
-      status: 503, code: "BILLING_NOT_CONFIGURED",
-    });
+    await errorReporter.flush();
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]).toMatchObject({ context: { statusCode: 503, code: "BILLING_NOT_CONFIGURED" } });
+    expect(JSON.stringify(diagnostics)).not.toMatch(/private-message|private message|private-token|private-provider-body|session-cookie/);
   });
 
   it("keeps the selected workspace available during billing recovery", async () => {
@@ -193,8 +206,8 @@ describe("billing page failure recovery", () => {
 
   it("opens a new-server purchase without selecting or fetching an existing subscription", async () => {
     const page = await BillingTabPage({ params: Promise.resolve({ tab: "plans" }),
-      searchParams: Promise.resolve({ newServer: "1", workspaceId: "cws-existing", organizationId: "org-a" }) });
-    expect(findElement(page, ManagedServerPurchase)).toBeDefined();
+      searchParams: Promise.resolve({ newServer: "1", workspaceId: "cws-existing", organizationId: "org-a", plan: "starter" }) });
+    expect(findElement<{ requestedPlanId: string }>(page, ManagedServerPurchase)?.props.requestedPlanId).toBe("starter");
     expect(findElement(page, BillingPlanSummary)).toBeUndefined();
     expect(findElement<{ view: BillingView }>(page, BillingPageView)?.props.view).toMatchObject({ newServer: true, plansOnly: true });
     expect(findElement<{ layout: string }>(page, BillingContent)?.props.layout).toBe("purchase");
@@ -208,6 +221,23 @@ describe("billing page failure recovery", () => {
     expect(findElement<{ billingState: unknown }>(page, BillingPlansRoute)?.props.billingState).toBe(state);
     expect(findElement(page, BillingPlanSummary)).toBeUndefined();
     expect(findElement<{ layout: string; sidebar: unknown }>(page, BillingContent)?.props).toMatchObject({ layout: "plans", sidebar: null });
+  });
+
+  it("continues pricing checkout explicitly and preserves it through organization activation", async () => {
+    const query = { newServer: "1", plan: "starter", startCheckout: "1",
+      checkoutIntent: "72e918ec-8d9c-4b81-bf43-7a5790ca239a" };
+    const page = await BillingTabPage({ params: Promise.resolve({ tab: "plans" }), searchParams: Promise.resolve(query) });
+    expect(findElement<{ autoCheckout: boolean; checkoutIntent: string }>(page, ManagedServerPurchase)?.props)
+      .toMatchObject({ autoCheckout: true, checkoutIntent: query.checkoutIntent, requestedPlanId: "starter" });
+    const other = await BillingTabPage({ params: Promise.resolve({ tab: "plans" }), searchParams: Promise.resolve({ ...query, organizationId: "org-b" }) });
+    expect(findElement<{ purchase: unknown }>(other, CloudBillingLink)?.props.purchase)
+      .toEqual({ planId: "starter", startCheckout: true, checkoutIntent: query.checkoutIntent });
+  });
+
+  it("does not automatically checkout a malformed retry identity", async () => {
+    const page = await BillingTabPage({ params: Promise.resolve({ tab: "plans" }),
+      searchParams: Promise.resolve({ newServer: "1", plan: "starter", startCheckout: "1", checkoutIntent: "invalid" }) });
+    expect(findElement<{ autoCheckout: boolean }>(page, ManagedServerPurchase)?.props.autoCheckout).toBe(false);
   });
 
   it("reconciles a checkout return even if the new-server query remains in the URL", async () => {
@@ -325,9 +355,10 @@ describe("billing page failure recovery", () => {
 
     await loadPage();
 
-    expect(console.warn).toHaveBeenCalledExactlyOnceWith("[billing] GET /billing/state failed", {
-      status: 500, code: "BILLING_API_ERROR",
-    });
+    await errorReporter.flush();
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]).toMatchObject({ context: { statusCode: 500, code: "BILLING_API_ERROR" } });
+    expect(JSON.stringify(diagnostics)).not.toMatch(/private-message|private message|private-token|private-provider-body|session-cookie/);
   });
 });
 

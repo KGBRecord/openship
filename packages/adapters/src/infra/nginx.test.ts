@@ -1,3 +1,4 @@
+import { diagnostics as errorDiagnostics } from "@repo/core/diagnostics";
 import { describe, expect, test, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import {
@@ -306,6 +307,31 @@ const PROXY: RouteConfig = {
 /** Same route, flagged as one whose TLS this box terminates (a custom domain). */
 const OURS: RouteConfig = { ...PROXY, terminatesTlsLocally: true };
 const BOOTSTRAP_DIR = "/etc/letsencrypt/openship-bootstrap/app.example.com";
+
+describe("NginxProvider path-only routes", () => {
+  test.each([false, true])("returns 404 outside explicit paths (existing TLS cert: %s)", async (withCert) => {
+    const { nginx, conf, files } = setup({ certDomains: withCert ? ["app.example.com"] : [] });
+    await nginx.registerRoute({
+      domain: "app.example.com",
+      tls: true,
+      terminatesTlsLocally: true,
+      notFound: true,
+      proxyLocations: [
+        { pathPrefix: "/v3", targetUrl: "http://10.0.0.2:9000" },
+        { pathPrefix: "/mcp", targetUrl: "http://10.0.0.3:4000", exact: true },
+        { pathPrefix: "/", targetUrl: "http://10.0.0.2:9000", exact: true },
+      ],
+    });
+    const config = conf("app-example-com")!;
+    expect(config).toMatch(/location \/ \{\s*(?:if[\s\S]*?\n\s*\}\s*)?return 404;/);
+    expect(config).toContain("location ^~ /v3 {");
+    expect(config).toContain("location = /mcp {");
+    expect(config).toContain("location = / {");
+    expect(config).not.toContain("proxy_pass undefined");
+    expect(config).toContain("listen 443 ssl;");
+    expect(JSON.parse(files.get(`${SITES}/app-example-com.route.json`)!)).toMatchObject({ notFound: true });
+  });
+});
 
 /**
  * Openship Cloud's shared edge proves this box controls a routing target by fetching
@@ -2225,7 +2251,7 @@ describe("a container edge refuses a mode it cannot aim at the file it wrote", (
    * inside the container, so `openresty -t` fails for EVERY domain on the edge.
    */
   test("a placeholder cert it cannot place is declined, not published", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const warn = vi.spyOn(errorDiagnostics, "warn").mockImplementation(() => {});
     try {
       const { nginx, conf, calls } = setup({
         provider: { containerEdge: true, certDir: OFF_MOUNT_CERT_DIR },
@@ -2241,7 +2267,7 @@ describe("a container edge refuses a mode it cannot aim at the file it wrote", (
       // own filesystem either.
       expect(calls.some((c) => c.startsWith("openssl "))).toBe(false);
 
-      const said = warn.mock.calls.map((a) => String(a[0])).join("\n");
+      const said = warn.mock.calls.map((a) => a.slice(1).map(String).join(" ")).join("\n");
       expect(said).toContain("not the same path");
       expect(said).toContain("serving HTTP only");
       // The real reason, not the openssl-missing guess the generic failure path prints.
@@ -3017,7 +3043,7 @@ describe("vercel.json path headers and URL shape", () => {
       expect(c).toContain(`add_header ${key} $${names[i]} always;`);
     }
     // The path lands in a regex, so an unescaped `.` would over-match.
-    expect(c).toContain('~^/a-b/ "dash";');
+    expect(c).toContain('~^/a-b/(?:\\?|$) "dash";');
   });
 
   test("escapes a dot in a path-scoped header's path", async () => {

@@ -15,8 +15,11 @@
  * new job does not depend on this process refreshing its local set.
  */
 
+import { diagnostics as errorDiagnostics } from "@repo/core/diagnostics";
 import { repos } from "@repo/db";
 import { safeErrorMessage } from "@repo/core";
+import { startWorkflowJob } from "./job-workflow";
+import { workflowJobConfig } from "./job.types";
 import { startCommandRun } from "./job-command";
 import { jobTargetsOrganization, resolveServerIds, type CommandConfig } from "./job.types";
 import { trackBackgroundWork } from "../../lib/background-work";
@@ -59,7 +62,7 @@ export async function refreshTriggerArm(): Promise<void> {
     }
     armed = next;
   } catch (err) {
-    console.warn(`[job-events] arm refresh failed: ${safeErrorMessage(err)}`);
+    errorDiagnostics.warn("platform/engine/modules/jobs/job-events", `[job-events] arm refresh failed: ${safeErrorMessage(err)}`, err);
   }
 }
 
@@ -82,7 +85,7 @@ export function fireJobTriggers(eventType: string, organizationId: string): void
         .filter(
           (job) =>
             job.enabled &&
-            job.actionType === "command" &&
+            ["command", "workflow"].includes(job.actionType) &&
             (job.triggerEvents ?? []).includes(eventType),
         )
         .map((job) => ({
@@ -93,15 +96,17 @@ export function fireJobTriggers(eventType: string, organizationId: string): void
       const servers = await repos.server.getMany(targetIds);
 
       for (const { job, serverIds } of candidates) {
-        if (jobTargetsOrganization(serverIds, servers) !== organizationId) continue;
+        const owner = workflowJobConfig(job)?.authority.organizationId ?? jobTargetsOrganization(serverIds, servers);
+        if (owner !== organizationId) continue;
         try {
-          await startCommandRun(job, "event");
+          if (job.actionType === "workflow") await startWorkflowJob(job, "event");
+          else await startCommandRun(job, "event");
         } catch (err) {
-          console.warn(`[job-events] ${job.key} dispatch failed: ${safeErrorMessage(err)}`);
+          errorDiagnostics.warn("platform/engine/modules/jobs/job-events", `[job-events] ${job.key} dispatch failed: ${safeErrorMessage(err)}`, err);
         }
       }
     } catch (err) {
-      console.warn(`[job-events] trigger dispatch failed for ${eventType}: ${safeErrorMessage(err)}`);
+      errorDiagnostics.warn("platform/engine/modules/jobs/job-events", `[job-events] trigger dispatch failed for ${eventType}: ${safeErrorMessage(err)}`, err);
     }
   })());
 }

@@ -1,5 +1,6 @@
 "use client";
 
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import { Icon as UiIcon } from "@repo/ui/icons";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
@@ -23,6 +24,8 @@ import { useCloud } from "@/context/CloudContext";
 import { usePlatform } from "@/context/PlatformContext";
 import { useI18n, interpolate } from "@/components/i18n-provider";
 import { mailHostname } from "@repo/core";
+import { canManageMailServers } from "@/lib/mail-availability";
+import { CloudMailClient } from "@/app/(dashboard)/emails/_components/cloud-mail-client";
 
 /**
  * Mail provider wizard — the app-catalog entry point for Openship Mail, and the
@@ -42,6 +45,12 @@ import { mailHostname } from "@repo/core";
 type Phase = "choose" | "connect" | "installing" | "done" | "error";
 
 export default function MailWizardPage() {
+  const platform = usePlatform();
+  if (!canManageMailServers(platform)) return <CloudMailClient />;
+  return <MailWizardInner />;
+}
+
+function MailWizardInner() {
   const router = useRouter();
   const { t } = useI18n();
   const w = t.projectSettings.appInstall;
@@ -94,7 +103,8 @@ export default function MailWizardPage() {
       try {
         const res = await mailApi.listMailServers();
         setMailServers(res?.servers ?? []);
-      } catch {
+      } catch (diagnosticFailure) {
+        observeCaughtError(diagnosticFailure, "dashboard/app/(dashboard)/apps/new/mail/page");
         // Wizard still works without it — the operator types the IMAP host.
       }
     })();
@@ -144,7 +154,8 @@ export default function MailWizardPage() {
           setErrorMsg(s.failureMessage || w.installFailed);
           setPhase("error");
         }
-      } catch {
+      } catch (diagnosticFailure) {
+        observeCaughtError(diagnosticFailure, "dashboard/app/(dashboard)/apps/new/mail/page");
         /* transient — keep polling */
       }
     };

@@ -1,5 +1,7 @@
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import { spawn } from "node:child_process";
-import { access, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { access, lstat, mkdtemp, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
 
@@ -12,6 +14,7 @@ import { assembleGitClone } from "./build-pipeline";
 import { GIT_SUBMODULE_UPDATE_ARGS } from "./git-clone";
 import { localGitSshWriter, materializeGitSsh, type GitSshMaterial } from "./git-ssh-material";
 import { generateDockerfile } from "./docker-build-plan";
+import { generatedBuildIgnore } from "./docker-recipes/cache";
 import { dockerfileNeedsBuildKit } from "./docker-buildkit-trace";
 import {
   dockerBuildContextDirectory,
@@ -105,7 +108,7 @@ function spawnGit(
 
     armIdle(); // start the clock; every stdout/stderr chunk resets it
 
-    child.on("error", (err) => {
+    child.on("error", (err) => { observeCaughtError(err, "adapters/runtime/docker-build-context");
       clearTimeout(idleTimer);
       reject(err);
     });
@@ -156,7 +159,8 @@ async function loadDockerignoreMatcher(rootPath: string): Promise<IgnoreMatcher 
   try {
     const contents = await readFile(join(rootPath, ".dockerignore"), "utf-8");
     return ignore().add(contents.split(/\r?\n/).map(anchorDockerignorePattern));
-  } catch {
+  } catch (diagnosticFailure) {
+    observeCaughtError(diagnosticFailure, "adapters/runtime/docker-build-context");
     return undefined; // no .dockerignore
   }
 }
@@ -252,7 +256,7 @@ async function resolveBuildContextDir(treeDir: string, contextSubdir: string): P
   const target = resolveWithinDirectory(treeDir, contextSubdir);
   if (!contextSubdir) return target;
 
-  const stats = await stat(target).catch(() => null);
+  const stats = await stat(target).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "adapters/runtime/docker-build-context"); return null; });
   if (!stats?.isDirectory()) {
     throw new Error(
       `Build context "${contextSubdir}" is not a directory in this source. Check the service's build path.`,
@@ -367,7 +371,7 @@ async function firstExistingCandidate(dir: string, candidates: string[]): Promis
     const candidatePath = join(dir, ...candidate.split("/"));
     const exists = await access(candidatePath)
       .then(() => true)
-      .catch(() => false);
+      .catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "adapters/runtime/docker-build-context"); return false; });
     if (exists) {
       return candidate;
     }
@@ -559,11 +563,15 @@ export async function prepareSourceTree(
       contextDir,
       dockerignorePruned: pruneDockerignore,
       cleanup: async () => {
-        await rm(contextDir, { recursive: true, force: true }).catch(() => {});
+        await rm(contextDir, { recursive: true, force: true }).catch((diagnosticFailure) => {
+          observeCaughtError(diagnosticFailure, "adapters/runtime/docker-build-context");
+        });
       },
     };
   } catch (error) {
-    await rm(contextDir, { recursive: true, force: true }).catch(() => {});
+    await rm(contextDir, { recursive: true, force: true }).catch((diagnosticFailure) => {
+      observeCaughtError(diagnosticFailure, "adapters/runtime/docker-build-context");
+    });
     throw error;
   }
 }
@@ -636,6 +644,9 @@ export async function resolveServiceDockerfile(
       )
     : await resolveDockerfileName(contextDir, resolvedRootDirectory, config.dockerfilePath);
   const hasRepositoryDockerfile = repositoryDockerfileName !== null;
+  if (hasRepositoryDockerfile && (config.runtimeVersion != null || config.runtimeImageOverride)) {
+    throw new Error("runtimeVersion and runtimeImage cannot change a repository Dockerfile. Remove these settings or configure the runtime in that Dockerfile.");
+  }
 
   // A generated recipe COPYs from the source root, so it cannot be satisfied by a
   // narrowed context — refuse regardless of `requireRepositoryDockerfile` rather
@@ -646,7 +657,7 @@ export async function resolveServiceDockerfile(
         generatedRecipeRefused: !requireRepositoryDockerfile,
         rootDockerfileExists: await access(join(contextDir, "Dockerfile"))
           .then(() => true)
-          .catch(() => false),
+          .catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "adapters/runtime/docker-build-context"); return false; }),
       }),
     );
   }
@@ -687,18 +698,34 @@ export async function resolveServiceDockerfile(
       }),
       "utf-8",
     );
+    if (config.buildCache) {
+      const ignoreFile = join(contextDir, ".dockerignore");
+      const info = await lstat(ignoreFile).catch(error => {
+        if (error.code === "ENOENT") return null;
+        throw error;
+      });
+      // Never follow a repository symlink to read or overwrite a host file.
+      if (!info || info.isFile()) {
+        const contents = info ? await readFile(ignoreFile, "utf8") : "";
+        const temporary = join(contextDir, `.openship-dockerignore-${randomUUID()}`);
+        try {
+          await writeFile(temporary, generatedBuildIgnore(contents));
+          await rename(temporary, ignoreFile);
+        } finally { await rm(temporary, { force: true }); }
+      }
+    }
   }
 
   const dockerfileName = repositoryDockerfileName ?? generatedName;
-  // Read only a repository Dockerfile: a generated recipe is ours and never uses
-  // BuildKit-only syntax, so re-reading it back off disk would be pure cost. A read
+  // Generated recipes declare cache mounts only on a confirmed BuildKit path.
+  // Reading a repository Dockerfile still detects its own syntax. A read
   // failure here must not fail the build — the builder choice is an optimization,
   // and the build itself is about to read the same file.
   const requiresBuildKit = hasRepositoryDockerfile
     ? await readFile(join(buildContextDir, ...dockerfileName.split("/")), "utf-8")
         .then(dockerfileNeedsBuildKit)
-        .catch(() => false)
-    : false;
+        .catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "adapters/runtime/docker-build-context"); return false; })
+    : config.buildCache === true;
   const ignoreContextPath =
     opts?.dockerignorePruned === false
       ? await loadContextIgnore(buildContextDir, contextKeepPaths(dockerfileName))
@@ -707,7 +734,7 @@ export async function resolveServiceDockerfile(
   // walking — the seed `entries` list is queued unconditionally — so the top level
   // has to be filtered here or a `.dockerignore`d root directory would still ship.
   const contextEntries = (await readdir(buildContextDir)).filter(
-    (entry) => !ignoreContextPath?.(entry),
+    (entry) => !/^\.openship-dockerignore-[a-f0-9-]{36}$/.test(entry) && !ignoreContextPath?.(entry),
   );
 
   return {

@@ -1,3 +1,4 @@
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import { exitCommand, rethrowCommandExit } from "../lib/command-exit";
 /**
  * `openship service` — manage the services inside a compose stack.
@@ -9,6 +10,7 @@ import { exitCommand, rethrowCommandExit } from "../lib/command-exit";
  */
 
 import { Command, Option } from "commander";
+import { openTerminal } from "../lib/terminal";
 import chalk from "chalk";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
@@ -22,7 +24,7 @@ import { UpdateServiceBody, parseInput } from "@repo/contracts";
 import { getShipClient, ApiError, hasShipCredentials } from "../lib/ship-client";
 import { isJsonMode, printJson, printTable, ok, err, info } from "../lib/output";
 import { collect, parsePairs, readJsonInput } from "../lib/command-input";
-import { fail, confirmOrExit, reportResult } from "../lib/cmd-helpers";
+import { fail, confirmOrExit, reportResult, reportExecResult } from "../lib/cmd-helpers";
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────
 
@@ -124,6 +126,7 @@ const listCmd = stackCommand("list")
         ["name", "kind", "image", "enabled", "exposed", "drift"],
       );
     } catch (e) {
+      observeCaughtError(e, "cli/commands/service");
       rethrowCommandExit(e);
       fail(e);
     }
@@ -139,6 +142,7 @@ const getCmd = stackCommand("get")
       const svc = await resolveService(projectId, service);
       printJson(await getShipClient().services.get(projectId, svc.id));
     } catch (e) {
+      observeCaughtError(e, "cli/commands/service");
       rethrowCommandExit(e);
       fail(e);
     }
@@ -188,6 +192,7 @@ const createCmd = stackCommand("create")
       }
       ok(`  Created service "${created.name}" (${created.id}).`);
     } catch (e) {
+      observeCaughtError(e, "cli/commands/service");
       rethrowCommandExit(e);
       fail(e);
     }
@@ -207,6 +212,7 @@ const deleteCmd = stackCommand("delete")
       const result = await getShipClient().services.remove(projectId, svc.id);
       reportResult(result, `Deleted service "${svc.name}".`);
     } catch (e) {
+      observeCaughtError(e, "cli/commands/service");
       rethrowCommandExit(e);
       fail(e);
     }
@@ -264,6 +270,7 @@ const syncCmd = stackCommand("sync")
       }
       ok(`  Synced ${synced.length} service(s).`);
     } catch (e) {
+      observeCaughtError(e, "cli/commands/service");
       rethrowCommandExit(e);
       fail(e);
     }
@@ -340,6 +347,7 @@ const containersCmd = stackCommand("containers")
         ["service", "status", "container", "ip", "port"],
       );
     } catch (e) {
+      observeCaughtError(e, "cli/commands/service");
       rethrowCommandExit(e);
       fail(e);
     }
@@ -377,6 +385,7 @@ function driftActionCommand(action: "accept" | "keep"): Command {
             : `  Kept your edits for "${svc.name}".`,
         );
       } catch (e) {
+        observeCaughtError(e, "cli/commands/service");
       rethrowCommandExit(e);
         fail(e);
       }
@@ -416,6 +425,7 @@ const envGetCmd = stackCommand("get")
         ["key", "value", "environment", "secret"],
       );
     } catch (e) {
+      observeCaughtError(e, "cli/commands/service");
       rethrowCommandExit(e);
       fail(e);
     }
@@ -464,6 +474,7 @@ const envSetCmd = stackCommand("set")
       }
       reportResult(result, `Saved ${Object.keys(desired).length} variable(s) on "${svc.name}" (${environment}). Apply to the running service with openship service env apply ${svc.id} --project ${projectId}.`);
     } catch (e) {
+      observeCaughtError(e, "cli/commands/service");
       rethrowCommandExit(e);
       fail(e);
     }
@@ -485,7 +496,9 @@ envCmd.addCommand(stackCommand("inspect")
       printJson(await getShipClient().services.getEnvironment(projectId, svc.id, {
         environment: parseOptionalEnvironmentScope(opts.env), inspectRuntime: !!opts.runtime,
       }));
-    } catch (error) { fail(error); }
+    } catch (error) {
+      observeCaughtError(error, "cli/commands/service");
+ fail(error); }
   }));
 
 envCmd.addCommand(stackCommand("reveal")
@@ -503,7 +516,9 @@ envCmd.addCommand(stackCommand("reveal")
       printJson(await getShipClient().services.revealEnv(projectId, svc.id, {
         keys, environment: parseOptionalEnvironmentScope(opts.env), source: opts.source, containerId: opts.container,
       }));
-    } catch (error) { fail(error); }
+    } catch (error) {
+      observeCaughtError(error, "cli/commands/service");
+ fail(error); }
   }));
 
 envCmd.addCommand(stackCommand("delete").alias("unset")
@@ -522,7 +537,9 @@ envCmd.addCommand(stackCommand("delete").alias("unset")
       const deletes = existing.filter(row => selected.has(row.key)).map(row => ({ key: row.key, sourceId: row.id }));
       const result = await getShipClient().services.mergeEnvVars(projectId, svc.id, { environment, upserts: [], deletes });
       reportResult(result, `Removed ${deletes.length} override(s). Apply saved changes with openship service env apply ${svc.id} --project ${projectId}.`);
-    } catch (error) { fail(error); }
+    } catch (error) {
+      observeCaughtError(error, "cli/commands/service");
+ fail(error); }
   }));
 
 envCmd.addCommand(stackCommand("apply")
@@ -536,7 +553,9 @@ envCmd.addCommand(stackCommand("apply")
       const result = await getShipClient().services.applyEnvironment(projectId, svc.id);
       reportResult(result, `Applied the saved environment to "${svc.name}" (container ${result.containerId}).`);
       if (result.warning && !isJsonMode()) err(result.warning);
-    } catch (error) { fail(error); }
+    } catch (error) {
+      observeCaughtError(error, "cli/commands/service");
+ fail(error); }
   }));
 
 // ─── logs (--follow via SSE) ──────────────────────────────────────────────────
@@ -587,6 +606,7 @@ const logsCmd = stackCommand("logs")
         }
       }
     } catch (e) {
+      observeCaughtError(e, "cli/commands/service");
       rethrowCommandExit(e);
       fail(e);
     }
@@ -618,14 +638,9 @@ const execCmd = stackCommand("exec")
         cwd: opts.cwd,
         timeoutMs: Number(opts.timeout),
       });
-      if (isJsonMode()) printJson(result);
-      else {
-        process.stdout.write(result.output);
-        if (result.truncated) info("  Output truncated.");
-        if (result.timedOut) err("  Command timed out.");
-      }
-      process.exitCode = result.timedOut ? 124 : result.exitCode;
+      reportExecResult(result);
     } catch (error) {
+      observeCaughtError(error, "cli/commands/service");
       rethrowCommandExit(error);
       fail(error);
     }
@@ -636,6 +651,31 @@ const execCmd = stackCommand("exec")
 export const serviceCommand = new Command("service")
   .alias("services")
   .description("Manage the services in a compose stack (a multi-service project)");
+
+serviceCommand.addCommand(stackCommand("terminal").argument("<service>", "Service name or ID")
+  .description("Open a shell in a running service on Cloud or a self-hosted server")
+  .option("--origin <url>", "Trusted dashboard origin (defaults to the saved context dashboard)")
+  .action(async (service: string, opts) => {
+    try {
+      const projectId = await resolveProject(opts.project);
+      const svc = await resolveService(projectId, service);
+      await openTerminal({ kind: "service", id: svc.id }, opts);
+    } catch (error) {
+      observeCaughtError(error, "cli/commands/service");
+ fail(error); }
+  }));
+
+serviceCommand.addCommand(stackCommand("volumes").argument("<service>", "Service name or ID")
+  .description("Read measured service volume sizes")
+  .action(async (service: string, opts) => {
+    try {
+      const projectId = await resolveProject(opts.project);
+      const svc = await resolveService(projectId, service);
+      printJson(await getShipClient().services.volumeSizes(projectId, svc.id));
+    } catch (error) {
+      observeCaughtError(error, "cli/commands/service");
+ fail(error); }
+  }));
 
 serviceCommand.addCommand(listCmd);
 serviceCommand.addCommand(getCmd);
@@ -651,7 +691,9 @@ serviceCommand.addCommand(stackCommand("update")
       const projectId = await resolveProject(opts.project);
       const svc = await resolveService(projectId, service);
       printJson(await getShipClient().services.update(projectId, svc.id, patch));
-    } catch (error) { fail(error); }
+    } catch (error) {
+      observeCaughtError(error, "cli/commands/service");
+ fail(error); }
   }));
 serviceCommand.addCommand(createCmd);
 serviceCommand.addCommand(deleteCmd);

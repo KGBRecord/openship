@@ -22,6 +22,8 @@ const MINUTE_MS = 60_000;
 
 /** All policy ids — keep in sync with `POLICIES` below. */
 export type PolicyId =
+  | "actions-runtime"
+  | "diagnostics"
   | "flood-ip"
   | "default-anon"
   | "default-authed"
@@ -37,6 +39,17 @@ export type PolicyId =
   | "support-reply";
 
 export const POLICIES: Record<PolicyId, RateLimitPolicy> = {
+  "actions-runtime": {
+    id: "actions-runtime", limit: 1200, windowMs: MINUTE_MS, subject: "ip",
+    description: "Capability-authenticated Actions artifact/cache metadata and bounded upload chunks, including runners behind a shared NAT.",
+  },
+  "diagnostics": {
+    id: "diagnostics",
+    limit: 20,
+    windowMs: MINUTE_MS,
+    subject: "ip",
+    description: "Bounded browser error batches, including before sign-in; never an unmetered log ingestion endpoint.",
+  },
   "support-reply": {
     id: "support-reply",
     limit: 30,

@@ -1,3 +1,4 @@
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import { exitCommand, rethrowCommandExit } from "./command-exit";
 /**
  * Small per-command helpers shared across the cross-cutting commands.
@@ -10,6 +11,7 @@ import { createInterface } from "node:readline/promises";
 import { stdin, stderr } from "node:process";
 import { ApiError } from "./ship-client";
 import { ValidationError } from "@repo/sdk/client";
+import type { AgentExecResult } from "@repo/contracts";
 import { isJsonMode, err, info, ok, printJson } from "./output";
 
 export function spin(text: string): Ora | null {
@@ -36,9 +38,24 @@ export function reportResult(result: unknown, message?: string): void {
 }
 
 /** Run SDK work with the same structured output and exit behavior in every mode. */
-export async function printResult(work: () => Promise<unknown>): Promise<void> {
-  try { printJson(await work()); }
-  catch (error) { fail(error); }
+export function printResult(work: () => Promise<unknown>): Promise<void>;
+export function printResult<T>(work: () => Promise<T>, render: (value: T) => void): Promise<void>;
+export async function printResult<T>(work: () => Promise<T>, render: (value: T) => void = printJson): Promise<void> {
+  try { render(await work()); }
+  catch (error) {
+    observeCaughtError(error, "cli/lib/cmd-helpers");
+ fail(error); }
+}
+
+/** Host and container execution have the same output and shell exit contract. */
+export function reportExecResult(result: AgentExecResult): void {
+  if (isJsonMode()) printJson(result);
+  else {
+    process.stdout.write(result.output);
+    if (result.truncated) info("  Output truncated.");
+    if (result.timedOut) err("  Command timed out.");
+  }
+  process.exitCode = result.timedOut ? 124 : result.exitCode >= 0 && result.exitCode <= 255 ? result.exitCode : 1;
 }
 
 export async function confirmOrExit(yes: boolean | undefined, question: string): Promise<void> {

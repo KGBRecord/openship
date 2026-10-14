@@ -1,6 +1,11 @@
 import { api, getActiveOrganizationId } from "./client";
 import { endpoints } from "./endpoints";
 
+/** Connection failures describe unavailable observations, not confirmed outages. */
+export function isMonitoringConnectionIssue(issue: Pick<SystemIssue, "kind">): boolean {
+  return issue.kind === "monitoring_offline" || issue.kind === "server_unreachable";
+}
+
 /**
  * The org-wide issue feed — the client half of `apps/api/src/modules/issues`.
  *
@@ -94,6 +99,7 @@ export interface IssueFeed {
   data: SystemIssue[];
   counts: IssueCounts;
   status: "open" | "resolved";
+  canClearHistory?: boolean;
 }
 
 type IssueCountsListener = (counts: IssueCounts, organizationId: string | null) => void;
@@ -195,6 +201,7 @@ export function runResolution(r: IssueResolution) {
 }
 
 export const issuesApi = {
+  clearHistory: () => api.delete<{ data: { deleted: number } }>(endpoints.issues.clearHistory),
   /** Open issues (default) or resolved incident history. */
   list: async (status: "open" | "resolved" = "open") => {
     const organizationId = getActiveOrganizationId();

@@ -27,7 +27,14 @@
  *           code, signal } | { type: "error", code, message } | { type: "pong" }
  */
 
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import type { Context } from "hono";
+import { trackBackgroundWork } from "@repo/platform/engine/lib/background-work";
+import {
+  TERMINAL_SUBPROTOCOL_PREFIX as SUBPROTOCOL_PREFIX,
+  TERMINAL_RESUME_SUBPROTOCOL_PREFIX as RESUME_SUBPROTOCOL_PREFIX,
+  TERMINAL_COLS_MAX as COLS_MAX, TERMINAL_ROWS_MAX as ROWS_MAX,
+} from "@repo/contracts";
 import { openServerShell } from "@repo/platform/engine/lib/server-execution";
 import { prepareCloudTerminal, cloudTerminalHandlers } from "../../lib/cloud/terminal-bridge";
 import { createProvisionLock } from "@repo/platform/engine/lib/provision-lock";
@@ -62,11 +69,10 @@ import {
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
-const SUBPROTOCOL_PREFIX = "openship.terminal.v1+";
 const HEARTBEAT_INTERVAL_MS = 25_000;
 // Sane bounds applied client-side AND server-side - never trust the wire.
-const COLS_MIN = 1, COLS_MAX = 1000;
-const ROWS_MIN = 1, ROWS_MAX = 500;
+const COLS_MIN = 1;
+const ROWS_MIN = 1;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -106,14 +112,13 @@ type ErrorCode =
   | "resume_failed"
   | "server_error";
 
-const RESUME_SUBPROTOCOL_PREFIX = "openship.terminal.resume+";
 
 // ─── Ticket endpoint (POST /api/terminal/ticket) ────────────────────────────
 
 export async function issueTicket(c: Context) {
   const ctx = getRequestContext(c);
 
-  const body = await c.req.json().catch(() => ({}));
+  const body = await c.req.json().catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "api/modules/terminal/terminal.controller"); return ({}); });
   const serverId = typeof body?.serverId === "string" ? body.serverId : "";
   if (!serverId) return c.json({ error: "serverId required" }, 400);
   const cloud = await prepareCloudTerminal(ctx, "server", serverId);
@@ -211,9 +216,10 @@ export const terminalWsHandler = upgradeWebSocket(async (c) => {
         const sessOrgId =
           (session.session as { activeOrganizationId?: string | null } | null)
             ?.activeOrganizationId ?? null;
-        activeOrgId = await resolveActiveOrganizationId(userId, sessOrgId).catch(() => null);
+        activeOrgId = await resolveActiveOrganizationId(userId, sessOrgId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "api/modules/terminal/terminal.controller"); return null; });
       }
-    } catch {
+    } catch (diagnosticFailure) {
+      observeCaughtError(diagnosticFailure, "api/modules/terminal/terminal.controller");
       // fall through to reject below
     }
   }
@@ -434,7 +440,8 @@ function buildHandlers(ctx: HandshakeCtx) {
           return;
         }
         auditId = row.id;
-      } catch {
+      } catch (diagnosticFailure) {
+        observeCaughtError(diagnosticFailure, "api/modules/terminal/terminal.controller");
         sendControl(ws, { type: "error", code: "server_error", message: "Could not reserve a terminal session. Retry to reconnect." });
         safeWsClose(ws, 1011, "server_error");
         return;
@@ -446,7 +453,10 @@ function buildHandlers(ctx: HandshakeCtx) {
       try {
         ({ shell, release } = await openServerShell(ctx.organizationId, ctx.serverId, { cols: 80, rows: 24, term: "xterm-256color" }));
       } catch (err: any) {
-        await repos.terminalSession.close(auditId, { exitReason: "server_error" }).catch(() => {});
+        observeCaughtError(err, "api/modules/terminal/terminal.controller");
+        await repos.terminalSession.close(auditId, { exitReason: "server_error" }).catch((diagnosticFailure) => {
+          observeCaughtError(diagnosticFailure, "api/modules/terminal/terminal.controller");
+        });
         const code: ErrorCode = ctx.managed ? "server_error" : classifySshError(err);
         sendControl(ws, { type: "error", code, message: err?.message || "Server connection failed" });
         safeWsClose(ws, 1011, code);
@@ -627,13 +637,17 @@ function writeStdin(state: ConnState, buf: Buffer): void {
  * still close the DB row. Stale handlers from a previous WS (e.g. after a
  * resume) are rejected by the `state.closed && !alreadyUnregistered` guard.
  */
-export async function teardown(
+export function teardown(
   state: ConnState,
   reason: TerminalExitReason,
   exitCode: number | null,
   alreadyUnregistered = false,
   forceClose = true,
 ) {
+  return trackBackgroundWork(teardownConnection(state, reason, exitCode, alreadyUnregistered, forceClose));
+}
+
+async function teardownConnection(state: ConnState, reason: TerminalExitReason, exitCode: number | null, alreadyUnregistered: boolean, forceClose: boolean) {
   // Full teardown already completed for this connection.
   if (state.ended) return;
 
@@ -689,7 +703,8 @@ export async function teardown(
         exitCode,
         exitReason: reason,
       });
-    } catch {
+    } catch (diagnosticFailure) {
+      observeCaughtError(diagnosticFailure, "api/modules/terminal/terminal.controller");
       // Admission expires rows past the hard cap on Cloud; self-hosted
       // startup also sweeps rows abandoned by a previous process.
     }

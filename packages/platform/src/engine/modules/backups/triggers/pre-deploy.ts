@@ -4,8 +4,9 @@
  * Called once in kickoffBuild, BEFORE workspace admission: backup workers need
  * that same workspace lock, so waiting inside it would deadlock managed deploys.
  */
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import { setTimeout as delay } from "node:timers/promises";
-import { repos } from "@repo/db";
+import { repos, type BackupPolicy } from "@repo/db";
 import {
   formatBytes,
   formatDuration,
@@ -23,6 +24,8 @@ import {
 const POLL_MS = 1_000;
 const PROGRESS_MS = 30_000;
 
+export type PreDeployBackupPolicy = Pick<BackupPolicy, "id" | "createdBy">;
+
 interface BackupTarget {
   policyId: string;
   userId: string;
@@ -32,6 +35,9 @@ interface BackupTarget {
 export async function firePreDeployBackups(opts: {
   projectId: string;
   organizationId: string;
+  /** Cloud queue admission captures the required set before taking its resource
+   * reservation. Later policy edits apply to subsequent admissions. */
+  policies?: readonly PreDeployBackupPolicy[];
   signal?: AbortSignal;
   log?: (message: string, level?: LogEntry["level"]) => void;
   promptUser?: (prompt: PromptPayload) => Promise<string>;
@@ -39,10 +45,10 @@ export async function firePreDeployBackups(opts: {
   throwIfDeploymentCancelled(opts.signal);
   const startedAt = Date.now();
   // Failure to read policies is not evidence that backups are disabled.
-  const policies = await repos.backupPolicy.listEnabledPreDeployByProject(opts.projectId);
+  const policies = opts.policies ?? await repos.backupPolicy.listEnabledPreDeployByProject(opts.projectId);
   if (policies.length === 0) return { enqueued: 0, completed: 0 };
   // Names are only presentation; an unavailable name must not bypass the gate.
-  const services = await repos.service.listByProject(opts.projectId).catch(() => []);
+  const services = await repos.service.listByProject(opts.projectId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/backups/triggers/pre-deploy"); return []; });
   const names = new Map(services.map((service) => [service.id, service.name]));
   const log = (message: string, level?: LogEntry["level"]) => {
     const line = `[pre-deploy-backup] ${message}`;
@@ -84,6 +90,7 @@ export async function firePreDeployBackups(opts: {
         if (runIds.length === 0) throw new Error("no backup runs were created");
         for (const id of runIds) pending.set(id, target);
       } catch (error) {
+        observeCaughtError(error, "platform/engine/modules/backups/triggers/pre-deploy");
         throwIfDeploymentCancelled(opts.signal);
         const message = `policy ${target.policyId}: ${safeErrorMessage(error)}`;
         failures.push({ target, message });
@@ -198,6 +205,7 @@ export async function firePreDeployBackups(opts: {
       );
       throwIfDeploymentCancelled(opts.signal);
     } catch (error) {
+      observeCaughtError(error, "platform/engine/modules/backups/triggers/pre-deploy");
       throwIfDeploymentCancelled(opts.signal);
       log(`No backup decision received; deployment stopped: ${safeErrorMessage(error)}`, "warn");
       throw new Error(`Pre-deploy backup decision failed: ${safeErrorMessage(error)}`);

@@ -10,6 +10,7 @@
  * the local side (mirroring users, creating sessions, managing codes).
  */
 
+import { reportCaughtError as observeCaughtError, diagnostics as errorDiagnostics } from "@repo/core/diagnostics";
 import { randomUUID, randomBytes, createHash, timingSafeEqual } from "node:crypto";
 import { db, schema, repos, eq } from "@repo/db";
 import { storeCloudSession } from "@repo/platform/engine/lib/cloud/session";
@@ -79,7 +80,7 @@ async function mirrorCloudUser(cloudUser: CloudUser): Promise<string> {
  * `session.create.before` hook because the caller has already done
  * the equivalent work (user provisioning, org resolution).
  *
- * Two `purpose` values exist:
+ * Three `purpose` values exist:
  *   - `"local-cookie"` — the row backing the browser cookie session
  *     created by desktop / cloud-callback / upgrade-to-auth flows.
  *     `id` is a UUID, no prefix. `activeOrganizationId` defaults to
@@ -89,6 +90,9 @@ async function mirrorCloudUser(cloudUser: CloudUser): Promise<string> {
  *     `sess_link_` so audit / forensics can tell linked-instance
  *     sessions apart from browser sessions. Caller MUST pass
  *     `activeOrganizationId` (the linked org context).
+ *   - `"local-cli"` — temporary session for a command authenticated with the
+ *     installation's private operator credential. No cookie is issued; the CLI
+ *     signs out after the command. A short explicit TTL bounds abandoned runs.
  *
  * Distinguishing the two purposes by id-prefix means
  * `POST /api/cloud/disconnect` deletes ONLY the linked row by its
@@ -96,7 +100,7 @@ async function mirrorCloudUser(cloudUser: CloudUser): Promise<string> {
  * the same `session` table.
  */
 export async function mintSession(opts: {
-  purpose: "local-cookie" | "linked-instance";
+  purpose: "local-cookie" | "linked-instance" | "local-cli";
   userId: string;
   activeOrganizationId?: string;
   ipAddress?: string | null;
@@ -106,6 +110,8 @@ export async function mintSession(opts: {
   const id =
     opts.purpose === "linked-instance"
       ? `sess_link_${randomBytes(12).toString("hex")}`
+      : opts.purpose === "local-cli"
+        ? `sess_cli_${randomBytes(12).toString("hex")}`
       : randomUUID();
   const token = randomBytes(32).toString("hex");
   const now = new Date();
@@ -160,7 +166,7 @@ async function generateHandoffCode(
   state?: string,
 ): Promise<string> {
   // Lazy purge — cheap, runs at most once per minute via inserts.
-  await repos.cloudHandoffCode.purgeExpired().catch(() => undefined);
+  await repos.cloudHandoffCode.purgeExpired().catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "api/lib/cloud-auth-proxy"); return undefined; });
 
   const code = randomBytes(32).toString("hex");
   await repos.cloudHandoffCode.create({
@@ -188,7 +194,7 @@ async function generateHandoffCode(
  * the CLI can poll idempotently.
  */
 async function findHandoffCodeByState(state: string): Promise<string | null> {
-  const row = await repos.cloudHandoffCode.findByState(state).catch(() => null);
+  const row = await repos.cloudHandoffCode.findByState(state).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "api/lib/cloud-auth-proxy"); return null; });
   return row?.code ?? null;
 }
 
@@ -209,9 +215,8 @@ async function exchangeHandoffCode(
 ): Promise<{ user: CloudUser; sessionToken: string } | null> {
   const row = await repos.cloudHandoffCode.consume(code);
   if (!row) {
-    console.error(
-      `[handoff-exchange-miss] code=${code.slice(0, 12)}… ` +
-        `not found in DB or already expired/consumed.`,
+    errorDiagnostics.error("api/lib/cloud-auth-proxy",
+      "[handoff-exchange-miss] Code not found or already expired/consumed.",
     );
     return null;
   }
@@ -219,14 +224,14 @@ async function exchangeHandoffCode(
   // PKCE verification — if a challenge was stored, verifier is mandatory
   if (row.codeChallenge) {
     if (!codeVerifier) {
-      console.warn(`[handoff] PKCE: code_verifier required but not provided`);
+      errorDiagnostics.warn("api/lib/cloud-auth-proxy", `[handoff] PKCE: code_verifier required but not provided`);
       return null;
     }
     const computed = createHash("sha256")
       .update(codeVerifier)
       .digest("base64url");
     if (computed !== row.codeChallenge) {
-      console.warn(`[handoff] PKCE mismatch`);
+      errorDiagnostics.warn("api/lib/cloud-auth-proxy", `[handoff] PKCE mismatch`);
       return null;
     }
   }
@@ -259,7 +264,7 @@ async function exchangeCodeWithCloud(
     body: JSON.stringify({ code, code_verifier: codeVerifier }),
   });
   if (!res.ok) {
-    console.error(
+    errorDiagnostics.error("api/lib/cloud-auth-proxy",
       `[cloud-auth] exchange-code returned ${res.status} from ${url}`,
     );
     return null;
@@ -269,7 +274,7 @@ async function exchangeCodeWithCloud(
   // it throw the whole connect-callback handler.
   const contentType = res.headers.get("content-type") ?? "";
   if (!contentType.includes("application/json")) {
-    console.error(
+    errorDiagnostics.error("api/lib/cloud-auth-proxy",
       `[cloud-auth] exchange-code returned non-JSON (content-type=${contentType}) from ${url}`,
     );
     return null;
@@ -280,10 +285,10 @@ async function exchangeCodeWithCloud(
     };
     return data ?? null;
   } catch (err) {
-    console.error(
+    errorDiagnostics.error("api/lib/cloud-auth-proxy",
       `[cloud-auth] exchange-code JSON parse failed: ${
         safeErrorMessage(err)
-      }`,
+      }`, err,
     );
     return null;
   }
@@ -403,7 +408,7 @@ function pollDesktopAuth(nonce: string): { status: "pending" | "resolved" | "exp
 
 function exchangeDesktopClaim(code: string): { token: string; expiresAt: Date } | null {
   if (!pendingClaim || pendingClaim.code !== code) {
-    console.log(`[desktop-auth] claim failed: ${!pendingClaim ? 'no pendingClaim' : 'code mismatch'}`);
+    errorDiagnostics.warn("api/lib/cloud-auth-proxy", `[desktop-auth] claim failed: ${!pendingClaim ? 'no pendingClaim' : 'code mismatch'}`);
     return null;
   }
   if (Date.now() - pendingClaim.createdAt > 60_000) {

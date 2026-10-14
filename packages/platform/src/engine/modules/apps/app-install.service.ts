@@ -8,6 +8,7 @@
  * aren't projects — the installer just returns the wizard route to hand off to.
  */
 
+import { reportCaughtError as observeCaughtError, diagnostics as errorDiagnostics } from "@repo/core/diagnostics";
 import { randomBytes, createHmac } from "node:crypto";
 export { installServicePorts, serviceRoutingPatch, type InstallAppRoute } from "@repo/core";
 import {
@@ -34,7 +35,7 @@ import {
   type TemplateServiceBuild,
 } from "@repo/core";
 import { getRuntimeCatalog, getTemplateForOrg, listOrgCustomApps } from "./catalog-source";
-import { appCloudConfiguration, ensureDraftAppResourceDefaults } from "./app-resource-defaults";
+import { appCloudConfiguration } from "./app-cloud-configuration";
 import type { AppHostFit, InstallAppInput } from "@repo/contracts";
 export type { InstallAppInput } from "@repo/contracts";
 import { cloudDockerResources } from "../../lib/resources";
@@ -52,7 +53,7 @@ import {
 } from "../../lib/plan-guard";
 import { getTrustedHostCapacity } from "../../lib/host-capacity";
 import { createProject } from "../projects/project-crud.service";
-import { resolveCloudProjectServer } from "../../lib/cloud-workspace-scope";
+import { resolveCloudProjectServer, workspaceForServer } from "../../lib/cloud-workspace-scope";
 import { createService, updateService, setServiceEnvVars } from "../services/service.service";
 
 /**
@@ -179,6 +180,7 @@ export async function getAppHostFit(
       await assertCloudDeploymentLimits(ctx.organizationId, configuration);
       return { ...unchecked, cloud: { resources, status: "ready" } };
     } catch (error) {
+      observeCaughtError(error, "platform/engine/modules/apps/app-install.service");
       return {
         ...unchecked,
         cloud: {
@@ -205,7 +207,7 @@ export async function getAppHostFit(
   if (target.serverId) {
     const server = await repos.server
       .getInOrganization(target.serverId, ctx.organizationId)
-      .catch(() => null);
+      .catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/apps/app-install.service"); return null; });
     if (!server) return unchecked;
     isLocalTarget = await isLocalHostRow(server);
   }
@@ -388,12 +390,14 @@ export async function installApp(
   assertInstallRoutes(template, input.routes);
 
   let workspaceId: string | undefined;
-  if (env.CLOUD_MODE) {
-    const { workspace, server } = await resolveCloudProjectServer(ctx.organizationId, input.serverId);
-    if (workspace) {
-      workspaceId = workspace.id;
-      input = { ...input, serverId: server!.id };
-    }
+  // Linked Cloud servers retain their workspace on self-hosted control planes
+  // too. Draft adoption must use the same owner as project creation.
+  const placement = env.CLOUD_MODE
+    ? await resolveCloudProjectServer(ctx.organizationId, input.serverId)
+    : input.serverId ? await workspaceForServer(ctx.organizationId, input.serverId) : null;
+  if (placement?.workspace) {
+    workspaceId = placement.workspace.id;
+    input = { ...input, serverId: placement.server!.id };
   }
 
   // Plan gate, before anything is written. Every catalog app becomes a
@@ -572,6 +576,7 @@ export async function installApp(
             svc.ports,
             input.routes,
             existingRow.ports as string[] | null,
+            workspaceId ? "cloud" : "server",
           ),
         });
       }
@@ -596,7 +601,13 @@ export async function installApp(
     await createService(ctx, project.id, {
       name: svc.name,
       image: svc.image,
-      ports: installServicePorts(svc.name, svc.ports, input.routes),
+      ports: installServicePorts(
+        svc.name,
+        svc.ports,
+        input.routes,
+        svc.ports,
+        workspaceId ? "cloud" : "server",
+      ),
       dependsOn: svc.dependsOn ? [...svc.dependsOn] : [],
       environment: plainEnv,
       volumes: svc.volumes ? [...svc.volumes] : [],
@@ -606,9 +617,7 @@ export async function installApp(
       commandArgv: svc.commandArgv ? [...svc.commandArgv] : undefined,
       restart: svc.restart,
       advanced: {
-        ...(env.CLOUD_MODE && existingDraft?.resources == null && svc.resources
-          ? { resources: { ...svc.resources } }
-          : {}),
+        ...(svc.entrypointArgv ? { entrypoint: [...svc.entrypointArgv] } : {}),
         ...(svc.healthcheck ? { healthcheck: svc.healthcheck } : {}),
         ...(filesByService.get(svc.name)?.length
           ? { files: filesByService.get(svc.name) }
@@ -655,17 +664,6 @@ export async function installApp(
   // whole production scope, so anything backfilled first would be wiped. This is what
   // makes the installer's guarantee unconditional rather than "if the first attempt ran
   // to completion".
-  if (env.CLOUD_MODE)
-    await ensureDraftAppResourceDefaults(
-      {
-        ...project,
-        organizationId: ctx.organizationId,
-        appTemplateId: template.id,
-        activeDeploymentId: null,
-        resources: existingDraft?.resources,
-      },
-      template,
-    );
   await ensureGeneratedAppSecrets(project.id, template);
 
   return { kind: "template", projectId: project.id, slug: project.slug };
@@ -780,13 +778,13 @@ export async function ensureGeneratedAppSecrets(
       if (Object.hasOwn(stored, field.key) || Object.hasOwn(storedAtProject, field.key)) continue;
       const group = field.generateGroup ?? field.jwtSecretGroup;
       if (group && blockedGroups.has(group)) {
-        console.warn(
+        errorDiagnostics.warn("platform/engine/modules/apps/app-install.service",
           `[apps] ${template.id}: ${serviceName}.${field.key} is missing, but its group "${group}" already has a value elsewhere that cannot be read — leaving it alone rather than writing a value the rest of the group would not match.`,
         );
         continue;
       }
       if (inlined.has(field.key)) {
-        console.warn(
+        errorDiagnostics.warn("platform/engine/modules/apps/app-install.service",
           `[apps] ${template.id}: ${serviceName}.${field.key} is missing and is inlined elsewhere in the template — not minting a value that its existing copies would contradict.`,
         );
         continue;
@@ -807,7 +805,7 @@ export async function ensureGeneratedAppSecrets(
   }
 
   if (written.length > 0) {
-    console.warn(
+    errorDiagnostics.warn("platform/engine/modules/apps/app-install.service",
       `[apps] ${template.id}: backfilled generated config on ${projectId}: ${written.join(", ")}`,
     );
   }
@@ -838,7 +836,8 @@ function resolveGeneratedGroups(
     if (!raw || groupValue.has(group)) continue;
     try {
       groupValue.set(group, decrypt(raw));
-    } catch {
+    } catch (diagnosticFailure) {
+      observeCaughtError(diagnosticFailure, "platform/engine/modules/apps/app-install.service");
       blockedGroups.add(group);
     }
   }

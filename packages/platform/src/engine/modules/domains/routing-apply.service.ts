@@ -13,9 +13,10 @@
  * by the caller, so a live-apply failure logs and defers to the next deploy.
  */
 
+import { reportCaughtError as observeCaughtError, diagnostics as errorDiagnostics } from "@repo/core/diagnostics";
 import { findActiveDeployment } from "@repo/platform/engine/lib/active-deployment";
 import { repos } from "@repo/db";
-import { safeErrorMessage } from "@repo/core";
+import { resolveWorkload, safeErrorMessage } from "@repo/core";
 import {
   CloudInfraProvider,
   edgeProxyFor,
@@ -69,7 +70,7 @@ export async function applyProjectRouting(
   } = {},
 ): Promise<void> {
   const warn = (message: string) => {
-    console.warn(message);
+    errorDiagnostics.warn("platform/engine/modules/domains/routing-apply.service", message);
     options.onWarning?.(message);
   };
   const project = await repos.project.findById(projectId);
@@ -172,6 +173,7 @@ export async function applyProjectRouting(
         await ensureRouteDomainRecord({ projectId, route: plan.route, domainByHostname });
         serviceRoutePlans.push(plan);
       } catch (error) {
+        observeCaughtError(error, "platform/engine/modules/domains/routing-apply.service");
         blockedHostnames.add(plan.route.hostname.toLowerCase());
         warn(`${plan.route.hostname}: ${safeErrorMessage(error)}`);
       }
@@ -198,7 +200,7 @@ export async function applyProjectRouting(
       domainByHostname,
     });
     for (const route of fanoutRoutes) {
-      requirePort(route.rootServiceId, route.rootPort);
+      if (route.rootServiceId) requirePort(route.rootServiceId, route.rootPort);
       for (const location of route.locations) requirePort(location.serviceId, location.port);
     }
 
@@ -409,6 +411,7 @@ export async function applyProjectRouting(
       });
     }
   } catch (err) {
+    observeCaughtError(err, "platform/engine/modules/domains/routing-apply.service");
     const warning = `[routing-apply] ${project.slug}: live routing re-apply failed (non-fatal, applies next deploy): ${safeErrorMessage(err)}`;
     warn(warning);
   } finally {
@@ -430,11 +433,17 @@ export async function applyCloudRouting(opts: {
   const errors = new Map<string, string>();
   const singleHostnames = new Set<string>();
   const compositeHostnames = new Set(project.compositeRoutes?.map(route => route.hostname.toLowerCase()));
+  const pathOnlyHostnames = new Set(project.compositeRoutes?.filter(route => !route.rootServiceId)
+    .map(route => route.hostname.toLowerCase()));
   const singleApp = opts.deployment &&
     ((opts.deployment.meta as DeploymentMeta)?.serviceDeploymentMode === "single" || defs.length === 0);
   if (singleApp) {
     const deployment = opts.deployment!;
     const staticRoot = resolveDeploymentStaticRoot(deployment, project);
+    const snapshot = deployment.meta as DeploymentMeta & {
+      workload?: string;
+      port?: number;
+    };
     const domains = buildProjectRouteDomains({
       project,
       projectDomains: domainRows,
@@ -442,6 +451,12 @@ export async function applyCloudRouting(opts: {
       certificateManagement: routing.certificateManagement,
       usesManagedRouting: true,
       isStatic: !!staticRoot,
+      staticContainerPort:
+        !staticRoot &&
+        (snapshot?.runtimeMode ?? "docker") === "docker" &&
+        resolveWorkload(snapshot?.workload ?? project.workloadType, project.hasServer) === "static"
+          ? (snapshot?.port ?? project.port ?? undefined)
+          : undefined,
     });
     const routingFields = compileProjectRoutingFields(project.routingConfig);
     for (const route of domains) {
@@ -464,7 +479,8 @@ export async function applyCloudRouting(opts: {
             targetUrl: `http://127.0.0.1:${target.port}`,
           });
         }
-      } catch (error) { errors.set(route.hostname, safeErrorMessage(error)); }
+      } catch (error) {
+        observeCaughtError(error, "platform/engine/modules/domains/routing-apply.service"); errors.set(route.hostname, safeErrorMessage(error)); }
     }
   }
   const rowByService = new Map(liveRows.map((row) => [row.serviceId, row]));
@@ -487,7 +503,7 @@ export async function applyCloudRouting(opts: {
     runtimeName: "docker",
     certificateManagement: routing.certificateManagement,
     usesManagedRouting: true,
-  });
+  }).filter(route => !pathOnlyHostnames.has(route.hostname.toLowerCase()));
   const fanoutRoutes = resolveDomainFanoutRoutes({
     routes: project.compositeRoutes,
     services: defs,
@@ -540,7 +556,7 @@ export async function applyCloudRouting(opts: {
     {
       hostname: string;
       custom: boolean;
-      serviceId: string;
+      serviceId?: string;
       port?: number;
       domain?: (typeof projectPlans)[number];
       locations?: NonNullable<typeof project.compositeRoutes>[number]["locations"];
@@ -591,8 +607,10 @@ export async function applyCloudRouting(opts: {
     try {
       if (table.domain)
         await ensureRouteDomainRecord({ projectId: project.id, route: table.domain, domainByHostname });
-      const root = await serviceTarget(table.serviceId, table.port);
-      const input = await rulesFor(table.serviceId, root);
+      const root = table.serviceId ? await serviceTarget(table.serviceId, table.port) : undefined;
+      const input = root && table.serviceId
+        ? await rulesFor(table.serviceId, root)
+        : compileRoutingToOblien(project.routingConfig ?? {});
       const locations = [...(table.locations ?? [])].sort(
         (a, b) =>
           b.pathPrefix.length - a.pathPrefix.length ||
@@ -624,8 +642,9 @@ export async function applyCloudRouting(opts: {
         });
       // A missing composite target leaves the existing full table untouched;
       // never publish a root-only intermediate table during a live edit.
-      await routing.publishRoute(table.hostname, root.port, table.custom, input);
+      await routing.publishRoute(table.hostname, root?.port, table.custom, input);
     } catch (error) {
+      observeCaughtError(error, "platform/engine/modules/domains/routing-apply.service");
       errors.set(key, safeErrorMessage(error));
     }
   }

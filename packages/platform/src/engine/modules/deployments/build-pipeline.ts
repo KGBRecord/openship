@@ -1,8 +1,13 @@
 /** Build → deploy execution engine. Extracted from build.service.ts — private pipeline: kickoffBuild fires executeBuildAndDeploy, which runs the build, deploy phases, and post-deploy sync. */
 
+import { withErrorContext } from "@repo/core/diagnostics/node";
+import { reportError, reportCaughtError as observeCaughtError, diagnostics as errorDiagnostics } from "@repo/core/diagnostics";
 import { findActiveDeployment } from "@repo/platform/engine/lib/active-deployment";
 import { posix as pathPosix } from "node:path";
-import { repos, type Project, type Deployment, type Domain } from "@repo/db";
+import { repos, runOutsideAdvisoryLock, type Project, type Deployment, type Domain } from "@repo/db";
+import { CloudBuildAdmissionDeferredError, withCloudBuildActivity, withCloudBuildExecutionOwnership, releaseCloudBuildSlot, runOutsideCloudBuildActivity } from "../../lib/cloud-build-activity";
+import { withCloudWorkspaceActivity, runOutsideCloudWorkspaceActivity } from "../../lib/cloud-workspace-lock";
+import { runOutsideProjectRuntimeLock } from "../../lib/project-runtime-lock";
 import { resolveDeploymentEnvironment } from "./deployment-environment";
 import {
   BUILD_ENV_VARS,
@@ -27,12 +32,14 @@ import type {
 } from "@repo/adapters";
 import {
   BareRuntime,
+  CloudDockerRuntime,
   BuildLogger,
   DockerRuntime,
   STATIC_RELEASE_BASE,
   sharedMountExecutor,
   resolveStaticOutputPath,
   ensurePortAvailable,
+  isDockerHostPortAvailable,
   allocateHostPort,
   runDeployPipeline,
   isMultiServiceRuntime,
@@ -61,6 +68,7 @@ import {
 import { isRealContainerRef } from "../../lib/container-ref";
 import { ensureRoutingReady } from "../../lib/edge-reconcile";
 import {
+  needsRunningApplication,
   resolveBuildRuntimeModes,
   resolveDeployRouting,
   reusedReleaseRouting,
@@ -89,11 +97,9 @@ import { resolveEdgeProviderOptions } from "../../lib/edge-provider-options";
 import { pinnedEdgeImage } from "../../lib/edge-image";
 import {
   preCreateServiceDeployments,
-  emitServiceCheckRun,
-  emitInitialServiceChecks,
   rollupDeploymentStatus,
 } from "./service-checks";
-import { firePreDeployBackups } from "../backups/triggers/pre-deploy";
+import { firePreDeployBackups, type PreDeployBackupPolicy } from "../backups/triggers/pre-deploy";
 import { buildBackgroundContext } from "../../lib/background-context";
 import * as sessionManager from "./session-manager";
 import {
@@ -108,6 +114,7 @@ import {
 import { auditPorts } from "./port-audit.service";
 import {
   allocateAndReservePinnedHostPort,
+  suggestAlternativePinnedHostPort,
   convergeTargetHostPortClaims,
   convergeTargetHostPortClaimsUnlocked,
   findOwnedPinnedHostPort,
@@ -152,9 +159,11 @@ import {
 import { serviceKind, type DeployableService } from "../../lib/deployable-service";
 import { resolveProjectRouteState } from "../domains/project-route.service";
 import { type DeploymentConfigSnapshot } from "./build.service";
+import { deploymentImagePullPolicy } from "./image-pull-policy";
 import * as settingsService from "../settings/settings.service";
 import {
   registerDeploymentExecution,
+  releaseDeploymentExecution,
   bindDeploymentBuildCancellation,
   raceDeploymentCancellation,
   deploymentCancellationKeepsProvisioned,
@@ -211,18 +220,6 @@ export async function resolveServicePipelineMode(
     return { useSingleAppPipeline: true, useServicePipeline: false, servicePreflightServices: [] };
   }
 
-  // A failed catalog install can reach this path directly from Retry. Seed only
-  // missing draft profiles before reading/finalizing the next snapshot; an
-  // explicit or restored service snapshot must keep its original allocation.
-  if (
-    project.appTemplateId &&
-    !project.activeDeploymentId &&
-    !snapshot.composeServices?.length &&
-    (env.CLOUD_MODE || snapshot.deployTarget === "cloud")
-  ) {
-    const { ensureDraftAppResourceDefaults } = await import("../apps/app-resource-defaults");
-    await ensureDraftAppResourceDefaults(project);
-  }
   const [servicePreflightServices, useServicePipeline] = await Promise.all([
     resolveProjectServicePreflightServices(project.id, snapshot.composeServices),
     shouldUseProjectServicePipeline(project, snapshot.composeServices),
@@ -244,7 +241,31 @@ export async function resolveServicePipelineMode(
  * row is missing. The caller decides whether to throw or carry on - for
  * `redeploy` we want to skip silently; for `triggerDeployment` we throw.
  */
+function detachedDeploymentContext<T>(work: () => T): T {
+  return runOutsideAdvisoryLock(() => runOutsideProjectRuntimeLock(() =>
+    runOutsideCloudWorkspaceActivity(() => runOutsideCloudBuildActivity(work))));
+}
+
+function ownedDeploymentExecution<T>(project: Project, dep: Deployment, work: () => Promise<T>): Promise<T> {
+  return env.CLOUD_MODE && project.workspaceId ? withCloudBuildExecutionOwnership(dep.id, work) : work();
+}
+
+async function finishCloudBuildPhase(workspaceId: string | null) {
+  if (!env.CLOUD_MODE || !workspaceId) return;
+  await releaseCloudBuildSlot();
+  void detachedDeploymentContext(() => import("./cloud-build-queue")
+    .then(({ drainCloudBuildQueue }) => drainCloudBuildQueue(workspaceId)))
+    .catch(error => errorDiagnostics.error("platform/engine/modules/deployments/build-pipeline", "Build-slot dispatch deferred to sweep", error));
+}
+
 export async function kickoffBuild(project: Project, dep: Deployment): Promise<string | null> {
+  if (!env.CLOUD_MODE || !project.workspaceId) return kickoffBuildNow(project, dep);
+  const { admitCloudBuild } = await import("./cloud-build-queue");
+  return admitCloudBuild(project, dep, (resources, backupPolicies) => kickoffBuildNow(project, dep, resources, backupPolicies));
+}
+
+async function kickoffBuildNow(project: Project, dep: Deployment, reservedBuildResources?: ResourceConfig | null,
+  backupPolicies?: readonly PreDeployBackupPolicy[]): Promise<string | null> {
   // Covers a legacy queued row submitted before the entry-point guard existed.
   resolveDeploymentEnvironment(project, dep.environment);
   const buildSession = await repos.deployment.findBuildSessionByDeploymentId(dep.id);
@@ -278,6 +299,10 @@ export async function kickoffBuild(project: Project, dep: Deployment): Promise<s
     buildSessionId: buildSession.id,
     projectId: project.id,
     organizationId: dep.organizationId,
+    ...(env.CLOUD_MODE && project.workspaceId ? { cloudBuildReservation: {
+      workspaceId: project.workspaceId, resources: reservedBuildResources ?? null,
+      exclusivePreparation: (backupPolicies?.length ?? 0) > 0,
+    } } : {}),
   });
   if (claimed === "state_changed") return buildSession.id;
   if (claimed === "project_unavailable") {
@@ -290,13 +315,25 @@ export async function kickoffBuild(project: Project, dep: Deployment): Promise<s
   }
   dep.status = "building";
 
-  const cancellationSignal = registerDeploymentExecution(dep.id);
-
-  void (async () => {
+  void detachedDeploymentContext(() => ownedDeploymentExecution(project, dep, () => withErrorContext({ kind: "deployment", component: "build-pipeline", projectId: project.id,
+    deploymentId: dep.id, organizationId: dep.organizationId, serverId: project.serverId ?? undefined }, async () => {
+    // A deferred row can be claimed again before this worker unwinds. Register
+    // only after exact execution ownership, so it cannot reuse the old signal.
+    const cancellationSignal = registerDeploymentExecution(dep.id);
+    let deferred = false;
     try {
+      if (env.CLOUD_MODE && project.workspaceId) {
+        const current = await repos.deployment.findById(dep.id);
+        if (!current || !["building", "deploying"].includes(current.status)) return;
+      }
       // Session admission can fail at capacity. It belongs inside the worker's
       // failure/lease cleanup so the claimed deployment cannot remain stuck.
-      sessionManager.createSession(dep.id, project.id);
+      if (env.CLOUD_MODE && project.workspaceId && sessionManager.getSession(dep.id)) {
+        // Deferred attempts keep their SSE subscribers, logs and sequence IDs.
+        sessionManager.updateStatus(dep.id, "building");
+      } else {
+        sessionManager.createSession(dep.id, project.id);
+      }
       const preDeployLogs: LogEntry[] = [];
       const persistPreDeployLogs = async () => {
         if (preDeployLogs.length === 0) return;
@@ -305,7 +342,7 @@ export async function kickoffBuild(project: Project, dep: Deployment): Promise<s
             logs: sanitizeLogsForPersistence(collapseTerminalLogs(preDeployLogs)),
           })
           .catch((error) =>
-            console.error(`[DEPLOY] Could not save backup logs for ${dep.id}:`, error),
+            errorDiagnostics.error("platform/engine/modules/deployments/build-pipeline", `[DEPLOY] Could not save backup logs for ${dep.id}:`, error),
           );
       };
       // Backup workers need workspace admission themselves. Complete this gate
@@ -315,6 +352,7 @@ export async function kickoffBuild(project: Project, dep: Deployment): Promise<s
         await firePreDeployBackups({
           projectId: project.id,
           organizationId: dep.organizationId,
+          policies: backupPolicies,
           signal: cancellationSignal,
           log: (message, level = "info") => {
             const entry: LogEntry = { timestamp: new Date().toISOString(), level, message };
@@ -333,8 +371,7 @@ export async function kickoffBuild(project: Project, dep: Deployment): Promise<s
         sessionManager.cancelPendingPrompt(dep.id);
         await persistPreDeployLogs();
       }
-      const { withCloudWorkspaceActivity } = await import("../../lib/cloud-workspace-lock");
-      await withCloudWorkspaceActivity(project.workspaceId, async () => {
+      const execute = async () => {
         // Cancellation/recovery can win while this worker waits for the server.
         // Re-read after admission so a recovered lease cannot start late work.
         if (project.workspaceId) {
@@ -347,10 +384,43 @@ export async function kickoffBuild(project: Project, dep: Deployment): Promise<s
           buildSession.id,
           cancellationSignal,
           preDeployLogs,
+          reservedBuildResources,
         );
-      }, cancellationSignal, { scope: `project:${project.id}` });
+      };
+      if (env.CLOUD_MODE && project.workspaceId) {
+        let activityStarted = false;
+        try {
+          await withCloudBuildActivity({ workspaceId: project.workspaceId, organizationId: dep.organizationId,
+            projectId: project.id, deploymentId: dep.id }, async () => {
+            activityStarted = true;
+            await execute();
+          }, cancellationSignal);
+        } catch (error) {
+          // Only an activation refusal is retryable. Never replay work or
+          // cleanup that threw after the activity callback began.
+          if (activityStarted || !(error instanceof CloudBuildAdmissionDeferredError)) throw error;
+          deferred = await repos.deployment.deferUnactivatedCloudBuild({
+            deploymentId: dep.id, buildSessionId: buildSession.id, projectId: project.id,
+            organizationId: dep.organizationId, workspaceId: project.workspaceId,
+          });
+          if (deferred) {
+            dep.status = "queued";
+            sessionManager.updateStatus(dep.id, "queued");
+          }
+          // false means cancellation/state change won; retain normal final
+          // acknowledgement rather than failing a deployment for temporary load.
+        }
+      } else {
+        await withCloudWorkspaceActivity(project.workspaceId, execute, cancellationSignal, { scope: `project:${project.id}` });
+      }
     } catch (err) {
-      console.error(`[DEPLOY] Fatal error for ${dep.id}:`, err);
+      // Once reset succeeds, presentation errors must not terminalize the newly
+      // queued job (or another replica's next claim).
+      if (deferred) {
+        errorDiagnostics.error("platform/engine/modules/deployments/build-pipeline", `Queued session update failed for ${dep.id}`, err);
+        return;
+      }
+      errorDiagnostics.error("platform/engine/modules/deployments/build-pipeline", `[DEPLOY] Fatal error for ${dep.id}:`, err);
       // executeBuildAndDeploy's inner try/catch only arms onFailure() after
       // snapshot + route state resolve. Anything that throws before that
       // (missing snapshot, route lookup crash, runtime resolution) would
@@ -359,19 +429,35 @@ export async function kickoffBuild(project: Project, dep: Deployment): Promise<s
       // message.
       await markDeploymentFailedFromOutside(dep.id, err);
     } finally {
-      // This is the quiescence acknowledgement used by project teardown. It is
-      // deliberately later than every lifecycle hook, cleanup, transport
-      // disposal, and fallback error write. A `cancelled` status by itself does
-      // not prove the deploy-phase worker stopped touching the host.
-      await completeDeploymentExecution(dep.id, buildSession.id, cancellationSignal);
-      // A limit can change while this worker is finishing, or after it fails.
-      // Reclamation starts only after acknowledgement, under the same lock as
-      // new deployment admission and teardown; either may win and defer it.
-      await import("./rollback/rollback-orchestrator")
-        .then(({ reconcileProjectRetentionSafe }) => reconcileProjectRetentionSafe(project.id))
-        .catch((err) => console.error(`[DEPLOY] Retention cleanup unavailable for ${project.id}:`, err));
+      if (deferred) {
+        // The transaction reset the durable lease. Keep execution ownership
+        // through unregistering, and let the scheduled sweep retry without a
+        // hot loop, completion acknowledgement, or retention work.
+        releaseDeploymentExecution(dep.id, cancellationSignal);
+      } else {
+        // This is the quiescence acknowledgement used by project teardown. It is
+        // deliberately later than every lifecycle hook, cleanup, transport
+        // disposal, and fallback error write. A `cancelled` status by itself does
+        // not prove the deploy-phase worker stopped touching the host.
+        await completeDeploymentExecution(dep.id, buildSession.id, cancellationSignal);
+        if (env.CLOUD_MODE && project.workspaceId) {
+          // Setup can fail before shared host admission. Active commands never
+          // lose their reservation through this unactivated-only cleanup.
+          await repos.cloudBuildActivity.cancelReservation({ workspaceId: project.workspaceId,
+            organizationId: dep.organizationId, projectId: project.id, deploymentId: dep.id });
+          void detachedDeploymentContext(() => import("./cloud-build-queue")
+            .then(({ drainCloudBuildQueue }) => drainCloudBuildQueue(project.workspaceId!)))
+            .catch(error => errorDiagnostics.error("platform/engine/modules/deployments/build-pipeline", "Cloud build queue retry deferred to sweep", error));
+        }
+        // A limit can change while this worker is finishing, or after it fails.
+        // Reclamation starts only after acknowledgement, under the same lock as
+        // new deployment admission and teardown; either may win and defer it.
+        await import("./rollback/rollback-orchestrator")
+          .then(({ reconcileProjectRetentionSafe }) => reconcileProjectRetentionSafe(project.id))
+          .catch((err) => errorDiagnostics.error("platform/engine/modules/deployments/build-pipeline", `[DEPLOY] Retention cleanup unavailable for ${project.id}:`, err));
+      }
     }
-  })();
+  }))).catch(error => errorDiagnostics.error("platform/engine/modules/deployments/build-pipeline", `Execution cleanup remains pending for ${dep.id}`, error));
 
   return buildSession.id;
 }
@@ -390,9 +476,10 @@ async function markDeploymentFailedFromOutside(
   deploymentId: string,
   error: unknown,
 ): Promise<void> {
+  reportError(error, { kind: "deployment", component: "build-pipeline", deploymentId, handled: true });
   const message = safeErrorMessage(error);
   try {
-    const dep = await repos.deployment.findById(deploymentId).catch(() => null);
+    const dep = await repos.deployment.findById(deploymentId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/build-pipeline"); return null; });
     if (!dep) return;
     if (["failed", "ready", "cancelled", "action_required", "no_changes"].includes(dep.status)) {
       // Inner onFailure already ran (or the deploy somehow succeeded). Nothing to do.
@@ -405,16 +492,20 @@ async function markDeploymentFailedFromOutside(
     await repos.deployment.updateStatus(deploymentId, "failed", {
       errorMessage: capacityError?.message ?? message,
       ...(capacityError ? { errorCode: capacityError.code, errorDetails: capacityError.details } : {}),
-    }).catch(() => {});
+    }).catch((diagnosticFailure) => {
+      observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/build-pipeline");
+    });
     const buildSession = await repos.deployment
       .findBuildSessionByDeploymentId(deploymentId)
-      .catch(() => null);
+      .catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/build-pipeline"); return null; });
     if (buildSession) {
       await repos.deployment
         .updateBuildSession(buildSession.id, {
           status: "failed",
         })
-        .catch(() => {});
+        .catch((diagnosticFailure) => {
+          observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/build-pipeline");
+        });
     }
     // SSE: surface the error to anyone watching the stream and close it.
     sessionManager.appendLog(deploymentId, {
@@ -424,7 +515,7 @@ async function markDeploymentFailedFromOutside(
     });
     sessionManager.updateStatus(deploymentId, "failed");
   } catch (handlerErr) {
-    console.error(
+    errorDiagnostics.error("platform/engine/modules/deployments/build-pipeline",
       `[DEPLOY] markDeploymentFailedFromOutside crashed for ${deploymentId}:`,
       handlerErr,
     );
@@ -461,6 +552,7 @@ async function archivePreviousDeployment(
       await onDeploymentReady({ newDeployment: finalDep, previousActive: prevDep ?? null });
     }
   } catch (err) {
+    observeCaughtError(err, "platform/engine/modules/deployments/build-pipeline");
     logger.log(
       `Warning: failed to record retention for rollback: ${safeErrorMessage(err)}\n`,
       "warn",
@@ -522,7 +614,7 @@ async function reuseRetainedArtifact(opts: {
     // deploy, which is what an executor that can't reach the tree at all would do.
     const exists = await (opts.staticExecutor ?? targetExecutor)
       ?.exists(staticDir)
-      .catch(() => false);
+      .catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/build-pipeline"); return false; });
     return exists ? reuse(staticDir) : gone(staticDir);
   }
 
@@ -550,7 +642,7 @@ async function reuseRetainedArtifact(opts: {
     }
 
     const image = pinnedAppImage(snapshot);
-    if (!image || !(await runtime.imageExistsLocally(image).catch(() => false))) {
+    if (!image || !(await runtime.imageExistsLocally(image).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/build-pipeline"); return false; }))) {
       throw new Error(
         "Cannot refresh without rebuilding because the active container image is unavailable. Use Redeploy instead.",
       );
@@ -563,7 +655,7 @@ async function reuseRetainedArtifact(opts: {
   // Only Docker's artifact is an image; any other runtime takes its normal path.
   const present =
     runtime instanceof DockerRuntime
-      ? await runtime.imageExistsLocally(image).catch(() => false)
+      ? await runtime.imageExistsLocally(image).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/build-pipeline"); return false; })
       : false;
   return present ? reuse(image) : gone(image);
 }
@@ -582,7 +674,7 @@ export async function finalizeComposeDeploy(opts: {
 }): Promise<void> {
   const { project, dep, logger } = opts;
 
-  // Rollup + per-service Checks. Failures here must not roll back the deploy.
+  // Roll up the runtime outcome; the durable GitHub reporter observes it later.
   try {
     const finalDep = await repos.deployment.findById(dep.id);
     if (finalDep && finalDep.status === "ready") {
@@ -627,38 +719,15 @@ export async function finalizeComposeDeploy(opts: {
         // at-least-one success — but guard defensively.
         await setDeploymentStatus(dep.id, "failed");
       }
-
-      // Per-service Checks API events.
-      for (const sd of perService) {
-        if (!sd.serviceName) continue;
-        if (sd.status === "skipped") continue; // already emitted up front
-        const conclusion =
-          sd.status === "success" || sd.status === "running"
-            ? "success"
-            : sd.status === "cancelled"
-              ? "cancelled"
-              : "failure";
-        await emitServiceCheckRun({
-          project,
-          dep,
-          serviceDeploymentId: sd.id,
-          serviceName: sd.serviceName,
-          conclusion,
-          output: {
-            title: `${sd.serviceName} ${conclusion}`,
-            summary: sd.errorMessage ?? sd.error ?? "",
-          },
-        }).catch(() => {});
-      }
     }
   } catch (err) {
     // Rollup failures must not roll back the deploy.
-    console.warn(`[build] rollup/Checks emission failed for ${dep.id}:`, err);
+    errorDiagnostics.warn("platform/engine/modules/deployments/build-pipeline", `[build] service rollup failed for ${dep.id}:`, err);
   }
 
   // Archive the predecessor only after this deployment reaches a success state.
   // Failed, cancelled, and reconciling deployments leave the live release intact.
-  const settled = await repos.deployment.findById(dep.id).catch(() => null);
+  const settled = await repos.deployment.findById(dep.id).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/build-pipeline"); return null; });
   if (settled?.status === "ready" || settled?.status === "partial_failure") {
     await archivePreviousDeployment(dep, project, logger);
   }
@@ -670,6 +739,7 @@ async function executeBuildAndDeploy(
   buildSessionId: string,
   cancellationSignal?: AbortSignal,
   initialLogs: LogEntry[] = [],
+  reservedBuildResources?: ResourceConfig | null,
 ) {
   const plat = platform();
   throwIfDeploymentCancelled(cancellationSignal);
@@ -732,7 +802,13 @@ async function executeBuildAndDeploy(
     await assertCloudDeploymentLimits(dep.organizationId, {
       projectId: project.id,
       resources: snapshot.resources, buildResources: snapshot.buildResources,
-      runsApplication: snapshotToClass(snapshot).workload !== "static",
+      runsApplication: needsRunningApplication({
+        workload: snapshotToClass(snapshot).workload,
+        runtimeMode: snapshot.runtimeMode,
+        cloudStaticHosting: snapshot.cloudStaticHosting,
+        willRunServices,
+        hasPrebuiltImage: Boolean(snapshot.releaseImageRef),
+      }),
       services: willRunServices ? serviceMode.servicePreflightServices : undefined,
       retainedImages: strictRefreshImages(snapshot),
     });
@@ -763,6 +839,7 @@ async function executeBuildAndDeploy(
       willRunServices,
       hasPrebuiltImage: Boolean(snapshot.releaseImageRef),
       runtimeMode: snapshot.runtimeMode,
+      cloudStaticHosting: snapshot.cloudStaticHosting,
     });
     if (runtimeModes.buildRuntimeMode === "docker" && snapshot.deployTarget !== "cluster") {
       logger.log(
@@ -810,9 +887,16 @@ async function executeBuildAndDeploy(
       workload,
       runtimeName: runtime.name,
       managedServer: resolved.effectiveTarget === "cloud",
+      cloudStaticHosting: snapshot.releaseImageRef ? "server" : snapshot.cloudStaticHosting,
       rootDirectory: snapshot.rootDirectory,
       outputDirectory: snapshot.outputDirectory,
     });
+
+    if (runtime instanceof CloudDockerRuntime && deployRouting.deployMode === "static-file-serve") {
+      // Failure/cancellation cleanup owns file artifacts, not Docker handles.
+      ctx.runtime = runtime.staticServeRuntime();
+      transports.add(ctx.runtime);
+    }
 
     const usesManagedRouting = resolved.usesManagedRouting;
     const targetExecutor: CommandExecutor | null = resolved.platform.executor;
@@ -850,43 +934,34 @@ async function executeBuildAndDeploy(
     });
     await setDeploymentStatus(dep.id, "building");
 
-    // Pre-create service_deployment rows so the dashboard sees a
-    // complete fan-out even before any service starts building. Rows
-    // for targeted services start as `pending`; everyone else is
-    // marked `skipped` up front. The composeBuild pipeline patches
-    // status as it goes; we roll up at the end.
-    //
-    // Done UP FRONT so a downstream crash still leaves a coherent
-    // (deployment, services[]) shape behind.
-    const serviceFanOut = await preCreateServiceDeployments(dep.id, project.id, {
+    // Record unchanged services up front. The service pipeline owns progress
+    // rows for targeted services; GitHub observes the persisted attempt.
+    await preCreateServiceDeployments(dep.id, project.id, {
       targetServiceIds: snapshot.targetServiceIds,
       forceAll: dep.forceAll ?? false,
     }).catch((err) => {
       // Best-effort: fan-out is a dashboard concern. A crash here must
       // not block the main build.
-      console.warn(`[build] preCreateServiceDeployments crashed for ${dep.id}:`, err);
-      return new Map<
-        string,
-        { id: string; serviceId: string; serviceName: string; targeted: boolean }
-      >();
+      errorDiagnostics.warn("platform/engine/modules/deployments/build-pipeline", `[build] preCreateServiceDeployments crashed for ${dep.id}:`, err);
     });
 
-    await emitInitialServiceChecks(serviceFanOut, project, dep);
-
-    // Both server types use the host's available capacity unless the project
-    // sets a limit. Managed builds get measured headroom below.
+    // Only the saved build configuration becomes Docker limits. Cloud admission
+    // reservations coordinate host activity; they must not replace those limits.
     const prodResources = resolveRuntimeResources(snapshot.resources);
-    let buildResources = resolveBuildResources(snapshot.buildResources);
+    const buildResources = resolveBuildResources(snapshot.buildResources);
     const needsBuild = !snapshot.releaseImageRef && !snapshot.refreshAppDeploymentId &&
-      (willRunServices ? cloudDockerNeedsBuild(serviceMode.servicePreflightServices, strictRefreshImages(snapshot)) : !snapshot.handoverAppImage);
-    if (snapshot.managedServer?.ownerWorkspaceId && needsBuild) {
+      (willRunServices ? cloudDockerNeedsBuild(serviceMode.servicePreflightServices, strictRefreshImages(snapshot)) : true);
+    if (reservedBuildResources !== undefined && needsBuild) {
+      if (!reservedBuildResources) throw new AppError("The build has no resource reservation. Submit a new deployment.", 409, "CLOUD_BUILD_RESERVATION_MISSING");
+      buildResourcesForRecovery = buildResources;
+      logger.log("→ Cloud build admitted on the selected server.\n");
+    } else if (snapshot.managedServer?.ownerWorkspaceId && needsBuild) {
       const { sampleCloudWorkspaceResources, workspaceBuildResources } = await import("../../lib/cloud-workspace-host");
       const id = snapshot.managedServer.ownerWorkspaceId;
-      const { usage, capacity } = await sampleCloudWorkspaceResources(dep.organizationId, id);
-      buildResources = workspaceBuildResources(capacity, usage, snapshot.buildResources ?? undefined);
+      const { usage, capacity } = await sampleCloudWorkspaceResources(dep.organizationId, id, buildResources.cpuCores > 0 || buildResources.memoryMb > 0);
+      workspaceBuildResources(capacity, usage, buildResources);
       buildResourcesForRecovery = buildResources;
-      snapshot.buildResources = buildResources;
-      logger.log(`→ Building inside the workspace using available capacity: ${buildResources.cpuCores} vCPU · ${buildResources.memoryMb} MB.\n`);
+      logger.log("→ Building inside the selected workspace.\n");
     }
 
     // Decrypt env vars from deployment (self-contained). decryptEnvMap
@@ -897,7 +972,7 @@ async function executeBuildAndDeploy(
       (dep.envVars ?? {}) as Record<string, string>,
       (key: string, err: unknown) => {
         failedEnvKeys.push(key);
-        console.warn(`[build] failed to decrypt env var ${key}: ${safeErrorMessage(err)}`);
+        errorDiagnostics.warn("platform/engine/modules/deployments/build-pipeline", `[build] failed to decrypt env var ${key}: ${safeErrorMessage(err)}`);
       },
     );
     // Surface dropped env in the BUILD LOG (not just the server console) so a
@@ -945,7 +1020,7 @@ async function executeBuildAndDeploy(
     // the App installation and is the only role with default GitHub
     // access (members need an explicit grant). A "first member" actor
     // would be DENIED by the github-access gate and break the build.
-    const orgOwner = await resolveOrgOwner(dep.organizationId).catch(() => null);
+    const orgOwner = await resolveOrgOwner(dep.organizationId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/build-pipeline"); return null; });
     const actorUserId = orgOwner?.userId ?? "";
 
     // Projects created before a GitHub Enterprise source was connected may
@@ -957,7 +1032,7 @@ async function executeBuildAndDeploy(
         dep.organizationId,
         project.gitOwner,
         project.installationId ?? undefined,
-      ).catch(() => null);
+      ).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/build-pipeline"); return null; });
       if (webBaseUrl) {
         snapshot.repoUrl = `${webBaseUrl.replace(/\/+$/, "")}/${project.gitOwner}/${project.gitRepo}.git`;
       }
@@ -1202,9 +1277,12 @@ async function executeBuildAndDeploy(
           gitAmbient: effectiveCloneOnTarget ? gitCred.ambient : undefined,
           cloneOnServer: effectiveCloneOnTarget,
           signal: cancellationSignal,
+          onBuildFinished: () => finishCloudBuildPhase(project.workspaceId),
         });
       } finally {
-        if (composeRelay) await composeRelay.close().catch(() => {});
+        if (composeRelay) await composeRelay.close().catch((diagnosticFailure) => {
+          observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/build-pipeline");
+        });
       }
 
       // Roll per-service results up into the project status, emit
@@ -1246,7 +1324,9 @@ async function executeBuildAndDeploy(
           // buildMode is derived from runtime.name === "docker", so the cast is sound.
           return await (runtime as DockerRuntime).buildStaticToHost(
             buildConfig,
-            `${STATIC_RELEASE_BASE}/.builds/${buildSessionId}`,
+            runtime instanceof CloudDockerRuntime
+              ? runtime.staticBuildPath(buildSessionId)
+              : `${STATIC_RELEASE_BASE}/.builds/${buildSessionId}`,
             logger,
           );
         }
@@ -1254,7 +1334,9 @@ async function executeBuildAndDeploy(
       } finally {
         // Reverse tunnel + remote helper script torn down regardless of outcome —
         // the credential is reachable only for the build's duration.
-        if (deployRelay) await deployRelay.close().catch(() => {});
+        if (deployRelay) await deployRelay.close().catch((diagnosticFailure) => {
+          observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/build-pipeline");
+        });
       }
     };
 
@@ -1288,10 +1370,11 @@ async function executeBuildAndDeploy(
             ...(workload === "web" ? { PORT: String(snapshot.port) } : {}),
           },
           resources: prodResources,
-          // An explicit update is the one operation that promises to refresh a
-          // mutable upstream ref. Versioned release refs are otherwise reused
-          // when already present on the target.
-          forcePull: dep.trigger === "update" || snapshot.forcePullImages === true,
+          // Updates, deploy hooks and manual deploys of a mutable ref refresh the
+          // image; digest-pinned refs are reused when already present. Shared with
+          // the Compose path so Docker and the cluster builder behave the same.
+          forcePull: deploymentImagePullPolicy(dep, snapshot.forcePullImages, releaseImageRef).force,
+          refreshMutableTag: deploymentImagePullPolicy(dep, snapshot.forcePullImages, releaseImageRef).refreshMutableTag,
         },
         logger,
       );
@@ -1312,6 +1395,7 @@ async function executeBuildAndDeploy(
     if (!reusedArtifact && buildResult.artifactOwned !== false) {
       provisioned.imageRef = buildResult.imageRef;
     }
+    await finishCloudBuildPhase(project.workspaceId);
 
     // The adapter's build abort controller ends when it returns an image. The
     // outer deployment signal remains live through preflight/activate/routing,
@@ -1417,12 +1501,12 @@ async function executeBuildAndDeploy(
       await onCancelled(ctx, undefined, {
         keepProvisioned: deploymentCancellationKeepsProvisioned(cancellationSignal),
       }).catch((cancelErr) =>
-        console.error(`[DEPLOY] Cancel cleanup failed for ${dep.id}:`, cancelErr),
+        errorDiagnostics.error("platform/engine/modules/deployments/build-pipeline", `[DEPLOY] Cancel cleanup failed for ${dep.id}:`, cancelErr),
       );
       return;
     }
     const message = err instanceof Error ? err.message : "Unknown error";
-    if (process.env.OPENSHIP_DEBUG_PIPELINE) console.error("[pipeline]", err);
+    if (process.env.OPENSHIP_DEBUG_PIPELINE) errorDiagnostics.error("platform/engine/modules/deployments/build-pipeline", "[pipeline]", err);
     // Only an UNSETTLED error is a deploy failure. An error thrown after the
     // outcome was recorded is bookkeeping: reporting it as a failure would
     // invert a working deploy and tear its containers down.
@@ -1537,8 +1621,7 @@ function buildDeployEnvironment(
     serve: ServeStrategy;
     previousRuntime: DeployPhaseInputs["runtime"];
     plannedDomains: ReturnType<typeof buildProjectRouteDomains>;
-    /** The project's opted-in readiness gate. `active: false` (the default) ⇒ no
-     *  gate is wired at all and the pipeline skips the step. */
+    /** Effective startup and optional readiness policy for this target. */
     readinessGate: ResolvedReadinessGate;
     /** Sink for a failure the gate decided to WARN about rather than veto. The
      *  caller folds these into the deploy's action-required warning. */
@@ -1561,34 +1644,11 @@ function buildDeployEnvironment(
 
   return {
     canOverlap: serve.canOverlap,
-    // Post-activate readiness gate — OPT-IN, and omitted entirely when the
-    // project didn't ask for one, so runDeployPipeline skips the step rather than
-    // calling a check that does nothing. That absence IS the default: a deploy
-    // reports ready as soon as the workload is up and routed. Listening state is
-    // still reported, by the advisory in-container `auditPorts` probe that runs
-    // after the deploy is live and cannot fail it.
-    //
-    // When a project does opt in, up to two layers run:
-    //
-    //  1. Stabilization — watch the container we just started and fail if it
-    //     bounces or exits. Asked of the RUNTIME (docker inspect), so it works
-    //     for remote/SSH targets too, independent of the probe below.
-    //  2. Readiness probe (TCP/HTTP) — dials the workload's port. Restricted to
-    //     a "local" target unless the serve strategy declares
-    //     `readinessWorksRemotely` for this target. For a running-process
-    //     workload, it then dials through the deploy target's own executor.
-    //
-    // `onFailure` decides what a failure means. "warn" (the default even when
-    // opted in) keeps the deploy ready and records an action-required warning;
-    // only "fail" throws, which vetoes the deploy before traffic is repointed and
-    // reverts to the previous deployment.
-    // Ordering + the warn-vs-fail decision live in runReadinessGate (readiness-gate.ts),
-    // shared with the compose pipeline so the two can't drift. This is just the
-    // adapter that supplies the two effects.
-    //
-    // `healthCheck` is the PIPELINE's name for this hook (DeployEnvironment, in
-    // @repo/adapters) and predates the project-level `readiness` field — the
-    // pipeline gates on any readiness verdict, whatever the caller calls it.
+    requireSuccessfulRoutes:
+      effectiveTarget === "cloud" && phase.deployRouting.deployMode === "static-file-serve",
+    // Cloud container startup is checked before cutover; optional TCP/HTTP
+    // probes retain their own policy. A conclusive startup failure uses the
+    // pipeline's existing failed-deploy/revert path.
     healthCheck: !readinessGate.active
       ? undefined
       : (containerId, cfg) =>
@@ -1604,7 +1664,7 @@ function buildDeployEnvironment(
                       runtime,
                       [{ serviceName: project.name || project.slug || "app", containerId }],
                       logger,
-                      { windowMs },
+                      { windowMs, onUnverified: onReadinessWarning },
                     )
                   ).filter((finding) => !finding.verdict.ok);
                   return unstable ? unstable.detail : null;
@@ -1694,6 +1754,7 @@ function buildDeployEnvironment(
                 onLog: (m, level) => logger.log(m, level ?? "info"),
               });
             } catch (err) {
+              observeCaughtError(err, "platform/engine/modules/deployments/build-pipeline");
               logger.log(
                 `Edge/routing setup failed — deploy continues; the app runs on its port and routing is retried later: ${safeErrorMessage(err)}\n`,
                 "warn",
@@ -1763,7 +1824,7 @@ function buildDeployEnvironment(
       if (deps.usesHostLoopback && runtime.name !== "bare") {
         hostPort =
           deps.reservedHostPort?.() ??
-          (await runtime.getContainerInfo(id).catch(() => null))?.hostPort ??
+          (await runtime.getContainerInfo(id).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/build-pipeline"); return null; }))?.hostPort ??
           undefined;
       }
       const targetUrl = await resolveUpstreamUrl({
@@ -1899,12 +1960,17 @@ async function executeServerDeploy(phase: DeployPhaseInputs, deployConfig: Deplo
   // port/route/readiness seams stubbed out below.
   const isWorker = phase.deployRouting.deployMode === "worker";
   const staticServeRuntime = isStaticFileServe
-    ? phase.effectiveTarget === "cloud" && runtime instanceof BareRuntime ? runtime : new BareRuntime({
-        workDir: process.env.OPENSHIP_NATIVE === "true" && phase.effectiveTarget === "local"
-          ? `${process.env.OPENSHIP_DATA_DIR}/workloads/static`
-          : STATIC_RELEASE_BASE,
-        executor: phase.staticExecutor ?? undefined,
-      })
+    ? runtime instanceof CloudDockerRuntime
+      ? runtime.staticServeRuntime()
+      : phase.effectiveTarget === "cloud" && runtime instanceof BareRuntime
+        ? runtime
+        : new BareRuntime({
+            workDir:
+              process.env.OPENSHIP_NATIVE === "true" && phase.effectiveTarget === "local"
+                ? `${process.env.OPENSHIP_DATA_DIR}/workloads/static`
+                : STATIC_RELEASE_BASE,
+            executor: phase.staticExecutor ?? undefined,
+          })
     : null;
   if (staticServeRuntime) phase.transports.add(staticServeRuntime);
   // Where the static doc-root lives: "" when a Docker sandbox build already
@@ -1922,11 +1988,11 @@ async function executeServerDeploy(phase: DeployPhaseInputs, deployConfig: Deplo
   const usesHostLoopback = phase.effectiveTarget !== "cloud" || runtime.name === "bare"
     ? usesHostLoopbackUpstream(routeStrategy, runtime) : false;
 
-  // The project's OPT-IN readiness gate. Inactive unless the project configured
-  // one, and inactive is the default — so by default nothing waits on the app
-  // after start and nothing can veto a deploy whose workload came up. Listening
-  // state still gets reported by the advisory `auditPorts` probe further down.
-  const readinessGate = resolveReadinessGate(project.readiness);
+  // Pages/file serving has no process to watch. Managed Cloud containers do,
+  // including workers and private apps that have no public HTTP endpoint.
+  const readinessGate = resolveReadinessGate(project.readiness, {
+    managedCloud: phase.effectiveTarget === "cloud" && !isStaticFileServe,
+  });
   // Failures the gate chose to WARN about (onFailure: "warn"), folded into the
   // deploy's action-required warning alongside routing issues.
   const readinessWarnings: string[] = [];
@@ -1937,7 +2003,7 @@ async function executeServerDeploy(phase: DeployPhaseInputs, deployConfig: Deplo
   // edge/routing orchestration stays there (not duplicated per strategy).
   const baseServe: ServeStrategy = isStaticFileServe
     ? {
-        canOverlap: false,
+        canOverlap: phase.effectiveTarget === "cloud",
         ensureRuntimeReady: async () => {},
         ensurePorts: async () => {},
         activate: (cfg) =>
@@ -2010,10 +2076,33 @@ async function executeServerDeploy(phase: DeployPhaseInputs, deployConfig: Deplo
               ? await previousRuntime
                   .getContainerInfo(prevDep.containerId)
                   .then((info) => info?.hostPort)
-                  .catch(() => undefined)
+                  .catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/build-pipeline"); return undefined; })
               : undefined;
             if (previousHostPort !== cfg.hostPort) {
-              await ensurePortAvailable(executor, cfg.hostPort, logger, promptUser);
+              const allocation = initialHostPortAllocation;
+              const target = phase.hostPortTarget;
+              await ensurePortAvailable(executor, cfg.hostPort, logger, promptUser, {
+                suggestAlternative:
+                  allocation && target && phase.hostPortTargetLockHeld
+                    ? (excluded) =>
+                        suggestAlternativePinnedHostPort({
+                          target,
+                          allocation,
+                          excluded,
+                          readClaims: () =>
+                            prepareTargetPinnedHostPorts({
+                              target,
+                              edgeProxy: edgeProxyFor(executor, "openresty", { ours: true }),
+                            }),
+                          allocate: (options) => allocateHostPort(executor, options),
+                          isAvailable: (port) => isDockerHostPortAvailable(executor, port),
+                          onSelected: (allocation) => {
+                            attemptedHostPortAllocations.push(allocation);
+                            pinnedHostPort = cfg.hostPort = allocation.port;
+                          },
+                        })
+                    : undefined,
+              });
             }
             return;
           }
@@ -2033,8 +2122,13 @@ async function executeServerDeploy(phase: DeployPhaseInputs, deployConfig: Deplo
                 .filter((port): port is number => Number.isFinite(port)),
             ),
           );
+          // As with the loopback pin above: the outgoing release still holds its
+          // ports at preflight, and bare can't overlap, so the pipeline stops it
+          // in the very next step. Prompting about it would stall every redeploy.
           for (const port of ports) {
-            await ensurePortAvailable(executor, port, logger, promptUser);
+            await ensurePortAvailable(executor, port, logger, promptUser, {
+              outgoingDeploymentId: prevDep?.id,
+            });
           }
         },
         activate: async (cfg, onLog) => {
@@ -2094,6 +2188,7 @@ async function executeServerDeploy(phase: DeployPhaseInputs, deployConfig: Deplo
     : baseServe;
 
   let pinnedHostPort: number | undefined;
+  let initialHostPortAllocation: AllocatedPinnedHostPort | undefined;
   const attemptedHostPortAllocations: Array<
     Pick<AllocatedPinnedHostPort, "claim" | "previousClaim" | "claimWasCreated">
   > = [];
@@ -2140,6 +2235,7 @@ async function executeServerDeploy(phase: DeployPhaseInputs, deployConfig: Deplo
               allocate: (allocationOptions) => allocateHostPort(executor, allocationOptions),
             });
             attemptedHostPortAllocations.push(allocation);
+            initialHostPortAllocation = allocation;
             pinnedHostPort = allocation.port;
             // A scan that couldn't RUN is not "nothing is listening". Say so
             // here or the bind failure blames Docker for a host we couldn't read.
@@ -2207,7 +2303,7 @@ async function executeServerDeploy(phase: DeployPhaseInputs, deployConfig: Deplo
   const previousRuntime = prevDep?.containerId
     ? await resolveDeploymentRuntime(prevDep)
         .then((r) => r.runtime)
-        .catch(() => runtime)
+        .catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/build-pipeline"); return runtime; })
     : runtime;
   if (previousRuntime !== runtime) phase.transports.add(previousRuntime);
 
@@ -2228,7 +2324,19 @@ async function executeServerDeploy(phase: DeployPhaseInputs, deployConfig: Deplo
     certificateManagement: ssl.certificateManagement,
     usesManagedRouting,
     isStatic: isStaticFileServe,
+    staticContainerPort:
+      !isStaticFileServe &&
+      phase.effectiveTarget === "cloud" &&
+      runtime.name === "docker" &&
+      snapshotToClass(snapshot).workload === "static"
+        ? deployConfig.port
+        : undefined,
   });
+  if (isStaticFileServe && phase.effectiveTarget === "cloud" && plannedDomains.length === 0) {
+    throw new Error(
+      "Cloud Pages requires a public endpoint. Configure a free or custom domain before deploying.",
+    );
+  }
   // Domains to prune after a successful deploy: project-level rows that
   // no longer back a current public endpoint AND aren't among the routes
   // we just planned. The size>0 guard is a safety valve — if endpoint
@@ -2281,6 +2389,7 @@ async function executeServerDeploy(phase: DeployPhaseInputs, deployConfig: Deplo
       // withEnsuredDomainRecord. Re-resolve against the row that exists now.
       routableDomains.push(withEnsuredDomainRecord(route, domainRecord));
     } catch (err) {
+      observeCaughtError(err, "platform/engine/modules/deployments/build-pipeline");
       const message = safeErrorMessage(err);
       logger.log(`Skipping domain "${route.hostname}" (not routed — ${message}).\n`, "warn");
       domainClaimWarnings.push(`${route.hostname}: ${message}`);
@@ -2319,7 +2428,7 @@ async function executeServerDeploy(phase: DeployPhaseInputs, deployConfig: Deplo
   // otherwise orphan. Skip the one runDeployPipeline already handles and the
   // sentinel. Best-effort; never blocks the deploy.
   if (prevDep) {
-    const prevServiceDeps = await repos.service.listByDeployment(prevDep.id).catch(() => []);
+    const prevServiceDeps = await repos.service.listByDeployment(prevDep.id).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/build-pipeline"); return []; });
     for (const sd of prevServiceDeps) {
       if (!isRealContainerRef(sd.containerId) || sd.containerId === prevDep.containerId) {
         continue;
@@ -2328,6 +2437,7 @@ async function executeServerDeploy(phase: DeployPhaseInputs, deployConfig: Deplo
         await previousRuntime.destroy(sd.containerId);
         logger.log(`Stopped leftover service container (${sd.containerId.slice(0, 12)}).\n`);
       } catch (err) {
+        observeCaughtError(err, "platform/engine/modules/deployments/build-pipeline");
         logger.log(
           `Warning: failed to stop leftover service container: ${safeErrorMessage(err)}\n`,
           "warn",
@@ -2391,14 +2501,16 @@ async function executeServerDeploy(phase: DeployPhaseInputs, deployConfig: Deplo
         phase.hostPortTarget,
         attemptedHostPortAllocations,
       ).catch((err) =>
-        logger.log(
+        { observeCaughtError(err, "platform/engine/modules/deployments/build-pipeline"); return logger.log(
           `Warning: failed to release cancelled host-port reservations: ${safeErrorMessage(err)}\n`,
           "warn",
-        ),
+        ); },
       );
     }
     for (const id of createdDomainIds) {
-      await repos.domain.remove(id).catch(() => {});
+      await repos.domain.remove(id).catch((diagnosticFailure) => {
+        observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/build-pipeline");
+      });
     }
     if (
       !deploymentCancellationKeepsProvisioned(phase.cancellationSignal) &&
@@ -2408,10 +2520,10 @@ async function executeServerDeploy(phase: DeployPhaseInputs, deployConfig: Deplo
       await runtime
         .destroy(deployResult.containerId)
         .catch((err) =>
-          logger.log(
+          { observeCaughtError(err, "platform/engine/modules/deployments/build-pipeline"); return logger.log(
             `Warning: failed to clean up cancelled container: ${safeErrorMessage(err)}\n`,
             "warn",
-          ),
+          ); },
         );
     }
     await onCancelled(ctx, buildResult.durationMs, {
@@ -2433,6 +2545,7 @@ async function executeServerDeploy(phase: DeployPhaseInputs, deployConfig: Deplo
         await runtime.destroy(deployResult.containerId);
         failedWorkloadCleaned = true;
       } catch (err) {
+        observeCaughtError(err, "platform/engine/modules/deployments/build-pipeline");
         logger.log(
           `Warning: failed to clean up container after deploy failure: ${safeErrorMessage(err)}\n`,
           "warn",
@@ -2485,6 +2598,7 @@ async function executeServerDeploy(phase: DeployPhaseInputs, deployConfig: Deplo
             await convergeTargetHostPortClaims(convergence);
           }
         } catch (err) {
+          observeCaughtError(err, "platform/engine/modules/deployments/build-pipeline");
           logger.log(
             `Host-port reservation cleanup deferred; uncertain reservations were retained safely. ${safeErrorMessage(err)}\n`,
             "warn",
@@ -2499,10 +2613,10 @@ async function executeServerDeploy(phase: DeployPhaseInputs, deployConfig: Deplo
       await repos.domain
         .remove(id)
         .catch((err) =>
-          logger.log(
+          { observeCaughtError(err, "platform/engine/modules/deployments/build-pipeline"); return logger.log(
             `Warning: failed to roll back domain record: ${safeErrorMessage(err)}\n`,
             "warn",
-          ),
+          ); },
         );
     }
     await onFailure(ctx, deployResult.error, buildResult.durationMs, {
@@ -2517,6 +2631,7 @@ async function executeServerDeploy(phase: DeployPhaseInputs, deployConfig: Deplo
   // not move it to a migration target until that target is genuinely live.
   if (pinnedHostPort !== undefined && pinnedHostPort !== project.hostPort) {
     await repos.project.update(project.id, { hostPort: pinnedHostPort }).catch((err) => {
+      observeCaughtError(err, "platform/engine/modules/deployments/build-pipeline");
       logger.log(
         `Warning: the deployment is live and its host port is reserved, but the project cache ` +
           `could not be updated: ${safeErrorMessage(err)}\n`,
@@ -2574,6 +2689,7 @@ async function executeServerDeploy(phase: DeployPhaseInputs, deployConfig: Deplo
         );
       }
     } catch (error) {
+      observeCaughtError(error, "platform/engine/modules/deployments/build-pipeline");
       hostPortClaimWarning =
         "Host-port reservation cleanup was deferred; uncertain reservations were retained safely.";
       logger.log(`${hostPortClaimWarning} ${safeErrorMessage(error)}\n`, "warn");
@@ -2789,6 +2905,7 @@ async function runPostDeploySync(opts: {
   for (const domain of obsoleteProjectDomains) {
     if (routing) {
       await routing.removeRoute(domain.hostname).catch((err) => {
+        observeCaughtError(err, "platform/engine/modules/deployments/build-pipeline");
         const message = safeErrorMessage(err);
         logger.log(
           `Warning: failed to remove stale route ${domain.hostname}: ${message}\n`,
@@ -2798,6 +2915,7 @@ async function runPostDeploySync(opts: {
     }
 
     await repos.domain.remove(domain.id).catch((err) => {
+      observeCaughtError(err, "platform/engine/modules/deployments/build-pipeline");
       const message = safeErrorMessage(err);
       logger.log(
         `Warning: failed to remove stale domain record ${domain.hostname}: ${message}\n`,
